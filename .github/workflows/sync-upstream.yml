@@ -1,0 +1,23 @@
+  name: Sync from upstream
+
+  on:
+    schedule:
+      - cron: "17 */6 * * *"
+    workflow_dispatch:
+
+  permissions:
+    contents: write
+
+  concurrency:
+    group: sync-upstream-main
+    cancel-in-progress: true
+
+  jobs:
+    sync:
+      runs-on: ubuntu-latest
+
+      steps:
+        - name: Sync main from Ari's repository
+          env:
+            GH_TOKEN: ${{ github.token }}
+          run: gh repo sync "${{ github.repository }}" --branch main
