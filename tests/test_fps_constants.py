@@ -1,28 +1,40 @@
 """FPS-relativity regression tests for the scraper's base-30 public table."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, fields, replace
+import json
+from pathlib import Path
 import subprocess
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.annotator.config import SHIPPED_THRESHOLDS
-from annotator.config import BaseAnnotatorConfig
-from annotator.resolve import resolve
-from src.annotator.fps_constants import probe_fps, scale_for_fps
+from annotator.config import SHIPPED_THRESHOLDS, BaseAnnotatorConfig
+from annotator.fps_constants import (
+    FPS_CONSTANT_FIELD_NAMES,
+    FpsConstants,
+    ScalingKind,
+    probe_fps,
+    scale_for_fps,
+)
 from annotator.point_winner import (
     Half,
     LandingFilterOptions,
     LandingKinematics,
     attribute_half,
     convert_landing_options,
-    pick_landing,
+    landing_window,
+    pick_landing_to_end,
     window_end,
 )
-from annotator.rally_segmentation import build_sticky_result, scale_thresholds, segment_video
+from annotator.rally_segmentation import (
+    build_sticky_result,
+    scale_thresholds,
+    segment_video,
+)
 from annotator.replay_mask import combine_mask, court_absence_signal
+from annotator.resolve import resolve
 
 
 def test_scale_for_fps_has_base_30_identity_for_every_scaled_row() -> None:
@@ -101,17 +113,89 @@ def test_scale_for_fps_visible_sample_rows_floor_at_two_frames() -> None:
     assert scale_for_fps(60.0).reentry_min_visible_frames == 5
 
 
-def test_probe_fps_rejects_vfr_and_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: subprocess.CompletedProcess(
-        args, 0, '{"streams": [{"r_frame_rate": "25/1", "avg_frame_rate": "30/1"}]}', '',
-    ))
+@pytest.mark.parametrize('fps', (23.976, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0))
+def test_every_fps_field_override_uses_its_shared_scaling_rule(fps: float) -> None:
+    overrides = {
+        field.name: float(index) + 0.25
+        for index, field in enumerate(fields(FpsConstants), start=1)
+    }
+    constants = scale_for_fps(fps, overrides)
+    speed_fields = {'rest_speed', 'start_speed'}
+    minimum_two_fields = {
+        'high_shot_oob_min_visible_frames',
+        'reentry_min_visible_frames',
+    }
+    for field_name, base30_value in overrides.items():
+        scaling = (
+            ScalingKind.PER_FRAME_SPEED
+            if field_name in speed_fields
+            else ScalingKind.FRAME_COUNT
+        )
+        expected = scaling.scale(base30_value, fps)
+        if field_name in minimum_two_fields:
+            expected = max(2, expected)
+        assert getattr(constants, field_name) == expected
+
+
+def test_resolve_accepts_every_fps_field_and_explicit_contact_threshold() -> None:
+    overrides = {
+        field.name: float(index) + 0.25
+        for index, field in enumerate(fields(FpsConstants), start=1)
+    }
+    overrides['contact_impulse_multiple'] = 5.5
+
+    resolved = resolve(BaseAnnotatorConfig(overrides_base30=overrides), 30.0)
+
+    assert FPS_CONSTANT_FIELD_NAMES == frozenset(field.name for field in fields(FpsConstants))
+    assert asdict(resolved.constants) == asdict(scale_for_fps(30.0, overrides))
+    assert resolved.thresholds.contact_impulse_multiple == 5.5
+
+
+def test_probe_fps_rejects_vfr_and_invalid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video = tmp_path / "video.mp4"
+    video.touch()
+    stream = {
+        "codec_type": "video",
+        "nb_frames": "10",
+        "nb_read_frames": "10",
+        "width": 64,
+        "height": 48,
+        "r_frame_rate": "25/1",
+        "avg_frame_rate": "30/1",
+        "start_time": "0",
+    }
+    payload = {"streams": [stream], "format": {"start_time": "0"}}
+
+    def fake_run(*args: object, **_: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(ValueError, match='variable frame rate'):
-        probe_fps('video.mp4')  # type: ignore[arg-type]
-    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: subprocess.CompletedProcess(
-        args, 0, '{"streams": [{"r_frame_rate": "0/1", "avg_frame_rate": "0/1"}]}', '',
-    ))
-    with pytest.raises(ValueError, match='invalid fps'):
-        probe_fps('video.mp4')  # type: ignore[arg-type]
+        probe_fps(video)
+    stream["r_frame_rate"] = "0/1"
+    stream["avg_frame_rate"] = "0/1"
+    with pytest.raises(ValueError, match='must be positive'):
+        probe_fps(video)
+
+
+def test_probe_fps_remains_lightweight_when_header_frame_count_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = tmp_path / "valid-cfr.mkv"
+    video.touch()
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        payload = {"streams": [{"r_frame_rate": "25/1", "avg_frame_rate": "25/1"}]}
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert probe_fps(video) == 25.0
+    assert len(commands) == 1
+    assert "-count_frames" not in commands[0]
+    assert commands[0][commands[0].index("-show_entries") + 1] == "stream=r_frame_rate,avg_frame_rate"
 
 
 def test_stage8_scaled_preset_changes_segmentation_at_50fps() -> None:
@@ -138,6 +222,29 @@ def test_landing_options_are_converted_once() -> None:
     assert (scaled.settle_win, scaled.settle_thr, scaled.settle_min, scaled.carry_win, scaled.carry_thr) == (
         12, 0.0024, 8, 12, 0.75,
     )
+
+
+@pytest.mark.parametrize('fps', (23.976, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0))
+def test_landing_options_use_shared_scaling_rules(fps: float) -> None:
+    options = LandingFilterOptions(
+        7,
+        0.004,
+        5,
+        7,
+        0.75,
+        use_settle=False,
+        use_carry=True,
+        null_if_all_carried=True,
+        use_ankle_rule=False,
+    )
+    expected = options._replace(
+        settle_win=int(ScalingKind.FRAME_COUNT.scale(options.settle_win, fps)),
+        settle_thr=float(ScalingKind.PER_FRAME_SPEED.scale(options.settle_thr, fps)),
+        settle_min=int(ScalingKind.FRAME_COUNT.scale(options.settle_min, fps)),
+        carry_win=int(ScalingKind.FRAME_COUNT.scale(options.carry_win, fps)),
+    )
+
+    assert convert_landing_options(options, fps) == expected
 
 
 def test_resolved_60fps_seam_drives_replay_segmentation_attribution_and_landing(
@@ -175,7 +282,7 @@ def test_resolved_60fps_seam_drives_replay_segmentation_attribution_and_landing(
     present[45:75] = False
     replay = combine_mask(present, None, None, None, n_frames, resolved.fps)
     plain_spans, _ = segment_video(track, thresholds=resolved.thresholds)
-    masked_spans, _ = segment_video(track, thresholds=resolved.thresholds, replay_mask=replay)
+    masked_spans, _ = segment_video(track, thresholds=resolved.thresholds, exclusion_mask=replay)
     assert plain_spans[0][0] == 45
     assert masked_spans[0][0] == 75
 
@@ -259,20 +366,22 @@ def test_resolved_60fps_seam_drives_replay_segmentation_attribution_and_landing(
 
     kin = LandingKinematics(np.full(n_frames, np.nan), np.full(n_frames, np.nan), np.zeros(n_frames))
     opts = LandingFilterOptions(1, 0.0, 1, 1, 0.0, use_settle=False, use_carry=False)
-    unscaled_landing = pick_landing(
-        final_contact, n_frames, landing_track, np.zeros(n_frames, dtype=bool), kin, opts, Half.TOP,
-        (520.0, 560.0), (1920.0, 1080.0), court_info,
-        replace(resolved.constants, sustained_loss_frames=10, min_descend_samples=3), resolved.fps,
+    dead = np.zeros(n_frames, dtype=bool)
+
+    def pick_with(constants):
+        end_frame = landing_window(
+            final_contact, n_frames, landing_track, dead, constants.sustained_loss_frames,
+        ).end_frame
+        return pick_landing_to_end(
+            final_contact, end_frame, landing_track, kin, opts, Half.TOP,
+            (520.0, 560.0), (1920.0, 1080.0), court_info, constants, resolved.fps,
+        )
+
+    unscaled_landing = pick_with(
+        replace(resolved.constants, sustained_loss_frames=10, min_descend_samples=3),
     )
-    landing = pick_landing(
-        final_contact, n_frames, landing_track, np.zeros(n_frames, dtype=bool), kin, opts, Half.TOP,
-        (520.0, 560.0), (1920.0, 1080.0), court_info, resolved.constants, resolved.fps,
-    )
-    double_scaled_landing = pick_landing(
-        final_contact, n_frames, landing_track, np.zeros(n_frames, dtype=bool), kin, opts, Half.TOP,
-        (520.0, 560.0), (1920.0, 1080.0), court_info,
-        replace(resolved.constants, min_descend_samples=12), resolved.fps,
-    )
+    landing = pick_with(resolved.constants)
+    double_scaled_landing = pick_with(replace(resolved.constants, min_descend_samples=12))
     assert unscaled_landing is not None
     assert unscaled_landing.frame == 139
     assert landing is not None

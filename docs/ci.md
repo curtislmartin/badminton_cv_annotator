@@ -1,20 +1,18 @@
 # CI / CD
 
-CI lives in `.github/workflows/` — the YAML is commented. No auto-deploy: prod is
-still a manual `docker compose -f docker-compose.prod.yml up --build -d` (see
-`DEPLOYMENT.md`). This doc covers only what you can't get from reading the YAML.
+CI lives in `.github/workflows/`. The retired web demo and its deployment
+workflow are no longer tested or deployed.
 
 ## What runs
 
 **`ci.yml`** (PRs + pushes to `main`), all blocking:
-`lint` (ruff) · `test` (pytest) · `frontend` (npm build; self-skips if `frontend/`
-is removed) · `docker-build` (builds the images, no push).
+`lint` (ruff and pyrefly) · `test` (pytest).
 
 **`pr-quality.yml`** (PRs, all non-blocking):
 `commit-lint` (compatibility status for existing branch protection) · `pr-body`
 (optional template-section suggestions) · `main-files` (deterministic; inserts
-a short **Main files changed** block into the PR body) · `advisory` (AI review,
-including commit-message feedback).
+a short **Main files changed** block into the PR body) · `advisory` (AI quick
+read based on the PR text and implementation diff).
 
 The pull request template still provides **What / Why / Testing / Reviewer
 focus** sections. PR content does not make these jobs fail. Gitlint remains
@@ -30,10 +28,14 @@ and only PATCHes when the block actually changes, so its own edit can't retrigge
 the `edited` run. No key needed; on fork PRs the token is read-only so it no-ops.
 Don't mark it required (it edits, doesn't gate).
 
-## Enable the AI advisory (optional, free)
+## Enable the AI quick read (optional, free)
 
-Off until you add a key; without one it skips silently. With one, it comments on
-commit/PR legibility and only ever *warns* on rate limits or outages — never blocks.
+Off until you add a key; without one it skips silently. With one, it posts a
+short explanation based mainly on a ranked sample of the implementation diff.
+The sample takes up to six meaningful files, with per-file and total size
+limits. Rate limits and outages only produce warnings, so the quick read never
+blocks a PR. A cut-off or malformed model response also produces a warning and
+does not replace the existing PR comment.
 
 1. Free key: <https://aistudio.google.com/app/apikey>
 2. Add it as repo secret **`PR_MESSAGE_BOT_KEY`** (Settings → Secrets and variables → Actions).
@@ -45,9 +47,9 @@ secrets, so it runs on in-repo branches only.
 
 ## Dependencies
 
-`requirements.txt` is pinned from `uv.lock` so CI installs what the image ships.
-`torch`/`torchvision` are unpinned — CI and the Dockerfile install them from an
-explicit PyTorch index first. After changing deps, run
+`requirements.txt` is pinned from `uv.lock` so CI uses a repeatable dependency
+set. `torch` and `torchvision` are unpinned because CI installs their CPU builds
+from the PyTorch index first. After changing dependencies, run
 `./scripts/gen-requirements.sh --check` and update any drifted pins.
 
 ## Branch protection

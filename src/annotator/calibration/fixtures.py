@@ -111,6 +111,12 @@ class Fixture:
             FilePin(self.scene_rows_path, self.digests.scene_rows, "fixtures"),
         )
 
+    @property
+    def run_video_files(self) -> tuple[FilePin, ...]:
+        """The eight pinned files consumed by ``build_run_video_inputs``."""
+        unused_path = self.pose_path("kp_scores")
+        return tuple(pin for pin in self.files if pin.path != unused_path)
+
 
 def fixtures_root() -> Path:
     """Return the configured external fixture root."""
@@ -244,7 +250,7 @@ def _load_calibration_geometry(
     homography_path: Path = _HOMOGRAPHY_SOURCE,
     resolution_path: Path = _RESOLUTION_SOURCE,
 ) -> dict[int, CalibrationGeometry]:
-    """Load and derive calibration geometry for every Wave 1 fixture."""
+    """Load and derive calibration geometry for every pinned ShuttleSet fixture."""
     homography_frame = _read_source_frame(homography_path, "homography")
     resolution_frame = _read_source_frame(resolution_path, "resolution")
     required_homography_columns = {"homography_matrix", *_CORNER_COLUMNS}
@@ -290,7 +296,8 @@ def _build_fixture(
 
 
 # External digest provenance and pre/post move equality are recorded in the
-# Wave 3 state packet under "Core external move map and pre-move MD5s". All
+# 2026-07-29 fixture-move state packet under "Core external move map and
+# pre-move MD5s". All
 # values below match that 2026-07-29 evidence.
 SSET_01 = _build_fixture(
     "sset_01",
@@ -386,4 +393,10 @@ def verify_file(pin: FilePin) -> None:
 def verify_fixture(fixture: Fixture) -> None:
     """Assert every external file named by a fixture."""
     for pin in fixture.files:
+        verify_file(pin)
+
+
+def verify_run_video_fixture(fixture: Fixture) -> None:
+    """Assert the external files read while assembling ``run_video`` inputs."""
+    for pin in fixture.run_video_files:
         verify_file(pin)

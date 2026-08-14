@@ -3,15 +3,18 @@
 Runs TrackNetV3 inference on clip .mp4 files to produce per-clip shuttle
 trajectory arrays. Both architectures share this step.
 
-TrackNetV3 is included in the repo (trimmed to inference only) and shares the
-BST training venv. Pretrained weights must be downloaded separately — see
-TrackNetV3/README.md.
+TrackNetV3 is included in the repo at ``src/shared/tracknetv3`` (trimmed to
+inference only) and shares the BST training venv. Pretrained weights must be
+downloaded separately — see ``src/shared/tracknetv3/README.md``.
 
 Usage:
-    python -m pipeline.shuttle_extractor --tracknet-dir TrackNetV3 [--clips-dir DIR] \
+    python -m pipeline.shuttle_extractor [--clips-dir DIR] \
         [--tracknet-python /path/to/bst-venv/bin/python] [--profile {bst,scrape}]
 """
 import argparse
+from collections.abc import Sequence
+from dataclasses import dataclass
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -23,11 +26,13 @@ if str(_SRC) not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
+from annotator.shuttle_track import validate_shuttle_track  # noqa: E402
 from pipeline.config import (  # noqa: E402
     CLIPS_OUTPUT_DIR, SHUTTLE_OUTPUT_DIR, RESOLUTION_CSV_PATH,
 )
 from scraper.config import SCRAPE_TRACKNET_STRIDE, SCRAPE_TRACKNET_LARGE_VIDEO  # noqa: E402
 
+DEFAULT_TRACKNET_DIR = _SRC / 'shared' / 'tracknetv3'
 _DEFAULT_TRACKNET_SUBPATH = Path('ckpts') / 'TrackNet_best.pt'
 _DEFAULT_INPAINTNET_SUBPATH = Path('ckpts') / 'InpaintNet_best.pt'
 TRACKNET_STRIDE = 1
@@ -54,8 +59,8 @@ def _default_csv_dir(clips_dir: Path) -> Path:
 def normalize_shuttlecock(arr: np.ndarray, v_width: float, v_height: float) -> np.ndarray:
     """Normalize shuttle coordinates by video resolution.
 
-    Normalizes x and y to [0, 1]. If a visibility column is present
-    (3rd column), it is passed through unchanged.
+    Scales x and y by the frame dimensions. In-frame positions become values
+    in [0, 1]. A third visibility column passes through unchanged.
 
     :param arr: (t, 2) or (t, 3) array. Columns: x, y, [visibility].
     :param v_width: Video width in pixels.
@@ -66,6 +71,77 @@ def normalize_shuttlecock(arr: np.ndarray, v_width: float, v_height: float) -> n
     result[:, 0] /= v_width
     result[:, 1] /= v_height
     return result
+
+
+@dataclass(frozen=True)
+class WholeVideoShuttle:
+    """One exact source ID and its frame-ordered annotator shuttle track."""
+
+    video_id: str
+    track: np.ndarray
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.video_id, str) or not self.video_id:
+            raise ValueError('whole-video shuttle video_id must be a non-empty string')
+        track = np.asarray(self.track)
+        validate_shuttle_track(track)
+        object.__setattr__(self, 'track', np.ascontiguousarray(track).copy())
+
+
+def whole_video_csv_to_shuttle(
+    csv_path: Path,
+    *,
+    video_id: str,
+    frame_count: int,
+    width: float,
+    height: float,
+) -> WholeVideoShuttle:
+    """Validate and reindex a whole-video TrackNet CSV for the annotator.
+
+    Frame rows may arrive in any order, but must identify each integer frame in
+    ``0..frame_count-1`` exactly once. This adapter is deliberately separate
+    from :func:`shuttle_csvs_to_npy`, whose clip-specific duplicate handling and
+    numeric ShuttleSet IDs remain a legacy contract.
+    """
+    if not Path(csv_path).is_file():
+        raise FileNotFoundError(f'whole-video TrackNet CSV is not a regular file: {csv_path}')
+    if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count <= 0:
+        raise ValueError(f'frame_count must be a positive integer, got {frame_count!r}')
+    for name, value in (('width', width), ('height', height)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f'{name} must be a finite positive number, got {value!r}')
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(f'{name} must be a finite positive number, got {value!r}')
+
+    frame = pd.read_csv(csv_path)
+    columns = ('Frame', 'X', 'Y', 'Visibility')
+    missing_columns = sorted(set(columns).difference(frame.columns))
+    if missing_columns:
+        raise ValueError(f'whole-video TrackNet CSV is missing columns: {missing_columns}')
+
+    frame_values = pd.to_numeric(frame['Frame'], errors='coerce').to_numpy(dtype=float)
+    if not np.isfinite(frame_values).all():
+        raise ValueError('TrackNet Frame values must be finite numbers')
+    if not np.equal(frame_values, np.floor(frame_values)).all():
+        raise ValueError('TrackNet Frame values must be integers')
+    if ((frame_values < 0) | (frame_values >= frame_count)).any():
+        invalid = frame_values[(frame_values < 0) | (frame_values >= frame_count)]
+        raise ValueError(
+            f'TrackNet Frame values must be in [0, {frame_count - 1}], got {invalid.tolist()}'
+        )
+    frame_ids = frame_values.astype(np.int64)
+    duplicate_ids = np.unique(frame_ids[pd.Index(frame_ids).duplicated(keep=False)])
+    if duplicate_ids.size:
+        raise ValueError(f'TrackNet Frame values contain duplicates: {duplicate_ids.tolist()}')
+    if len(frame_ids) != frame_count:
+        missing_ids = np.setdiff1d(np.arange(frame_count, dtype=np.int64), frame_ids)
+        raise ValueError(f'TrackNet Frame values have gaps: {missing_ids.tolist()}')
+
+    ordered = frame.assign(_frame_id=frame_ids).set_index('_frame_id').reindex(range(frame_count))
+    values = ordered.loc[:, ['X', 'Y', 'Visibility']].apply(pd.to_numeric, errors='coerce')
+    shuttle_camera = values.to_numpy(dtype=float)
+    shuttle_norm = normalize_shuttlecock(shuttle_camera, float(width), float(height))
+    return WholeVideoShuttle(video_id=video_id, track=shuttle_norm)
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +159,8 @@ def extract_all_shuttles(
     tracknet_stride: int = TRACKNET_STRIDE,
     large_video: bool = TRACKNET_LARGE_VIDEO,
     dry_run: bool = False,
+    video_paths: Sequence[Path] | None = None,
+    enable_inpainting: bool = True,
 ) -> None:
     """Run TrackNetV3 on all clips using batch mode.
 
@@ -96,6 +174,12 @@ def extract_all_shuttles(
 
     :param tracknet_dir: Path to the cloned TrackNetV3 repository.
     :param clips_dir: Root clips directory to scan for .mp4 files.
+    :param video_paths: Optional explicit source paths. This preserves the legacy
+        ``clips_dir`` scan by default while allowing selected whole-video files
+        whose download container is not ``.mp4``.
+    :param enable_inpainting: Whether to resolve and pass InpaintNet weights.
+        Defaults to the legacy enabled behavior; dataset-builder callers can
+        explicitly disable it without falling back to the default checkpoint.
     :param output_csv_dir: Directory for TrackNetV3 CSV outputs.
         Defaults to clips_dir/../shuttle_csv.
     :param model_path: Path to TrackNet weights. Defaults to tracknet_dir/ckpts/TrackNet_best.pt.
@@ -118,17 +202,31 @@ def extract_all_shuttles(
     if not resolved_model.exists():
         raise FileNotFoundError(f'TrackNet weights not found: {resolved_model}')
 
-    resolved_inpaint = inpaintnet_path or (tracknet_dir / _DEFAULT_INPAINTNET_SUBPATH)
-    if not resolved_inpaint.exists():
-        print(f'  WARNING: InpaintNet weights not found: {resolved_inpaint}')
-        print(f'  Running TrackNet only (no inpainting of occluded frames)')
+    if not isinstance(enable_inpainting, bool):
+        raise ValueError('enable_inpainting must be boolean')
+    if not enable_inpainting:
         resolved_inpaint = None
+    else:
+        resolved_inpaint = inpaintnet_path or (tracknet_dir / _DEFAULT_INPAINTNET_SUBPATH)
+        if not resolved_inpaint.exists():
+            print(f'  WARNING: InpaintNet weights not found: {resolved_inpaint}')
+            print(f'  Running TrackNet only (no inpainting of occluded frames)')
+            resolved_inpaint = None
 
     if not output_csv_dir:
         output_csv_dir = _default_csv_dir(clips_dir)
     output_csv_dir.mkdir(parents=True, exist_ok=True)
 
-    all_clips = sorted(clips_dir.rglob('*.mp4'))
+    if video_paths is None:
+        all_clips = sorted(clips_dir.rglob('*.mp4'))
+    else:
+        all_clips = sorted((Path(path) for path in video_paths), key=lambda path: path.name)
+        missing = [path for path in all_clips if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f'explicit TrackNet videos are not regular files: {missing}')
+        stems = [path.stem for path in all_clips]
+        if len(stems) != len(set(stems)):
+            raise ValueError('explicit TrackNet video paths must have unique stems')
     # Filter to clips that don't already have results (dry_run processes all)
     if dry_run:
         pending = all_clips
@@ -284,8 +382,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='Extract shuttle trajectories from ShuttleSet clips using TrackNetV3.',
     )
-    parser.add_argument('--tracknet-dir', type=Path, required=True,
-                        help='Path to cloned TrackNetV3 repository')
+    parser.add_argument('--tracknet-dir', type=Path, default=DEFAULT_TRACKNET_DIR,
+                        help='TrackNetV3 directory (default: src/shared/tracknetv3)')
     parser.add_argument('--clips-dir', type=Path, default=CLIPS_OUTPUT_DIR,
                         help='Directory containing generated clips')
     parser.add_argument('--csv-dir', type=Path, default=None,

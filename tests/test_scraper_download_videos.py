@@ -46,9 +46,11 @@ def _run_main_with_fake_outcomes(
         task: tuple[str, str, str, Path],
         *,
         allow_missing_audio: bool,
+        video_only: bool,
         existing_videos: dict[str, object],
+        accept_silent_video: bool = False,
     ) -> downloader.DownloadOutcome:
-        del allow_missing_audio, existing_videos
+        del allow_missing_audio, video_only, existing_videos, accept_silent_video
         url, video_id, title, _output_dir = task
         called_ids.append(video_id)
         if video_id in failed_ids:
@@ -83,10 +85,18 @@ def test_download_argv_requests_h264_video_and_audio(
     monkeypatch,
 ) -> None:
     output_dir = tmp_path / 'videos'
-    output_dir.mkdir()
+    candidates_path = tmp_path / 'candidates.csv'
+    _write_candidates(candidates_path, [_candidate('abc123')])
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     monkeypatch.setattr(downloader.shutil, 'which', lambda name: f'/bin/{name}')
+    monkeypatch.setattr(downloader.config, 'YTDLP_BIN', 'configured-yt-dlp')
+    monkeypatch.setattr(downloader.config, 'YTDLP_RETRIES', 7)
+    monkeypatch.setattr(downloader.config, 'SLEEP_INTERVAL_S', 6)
+    monkeypatch.setattr(downloader.config, 'MAX_SLEEP_INTERVAL_S', 16)
+    monkeypatch.setattr(downloader.config, 'SLEEP_REQUESTS_S', 11)
+    monkeypatch.setattr(downloader.config, 'LIMIT_RATE', '3M')
+    monkeypatch.setattr(downloader.config, 'CONCURRENT_FRAGMENTS', 2)
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append((argv, kwargs))
@@ -96,39 +106,120 @@ def test_download_argv_requests_h264_video_and_audio(
     monkeypatch.setattr(downloader.subprocess, 'run', fake_run)
     monkeypatch.setattr(downloader, '_probe_audio', lambda path: True)
 
-    result = downloader.download_video(
-        url='https://example.test/watch?v=abc123',
-        video_id='abc123',
-        title='Example title',
+    outcomes = downloader.download_all_videos(
+        candidates_path=candidates_path,
         output_dir=output_dir,
-        allow_missing_audio=False,
+        max_workers=1,
     )
 
-    assert result == 'abc123.mp4'
+    assert outcomes[0].filename == 'abc123.mp4'
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert argv[:3] == [
-        'yt-dlp',
+        'configured-yt-dlp',
         '--format',
         downloader._YTDLP_FORMAT,
     ]
     assert argv[argv.index('--output') + 1] == str(output_dir / 'abc123.%(ext)s')
     assert argv[argv.index('--merge-output-format') + 1] == 'mp4'
     assert argv[argv.index('--no-playlist')] == '--no-playlist'
-    assert argv[argv.index('--retries') + 1] == '3'
-    assert argv[argv.index('--sleep-interval') + 1] == '5'
-    assert argv[argv.index('--max-sleep-interval') + 1] == '15'
-    assert argv[argv.index('--sleep-requests') + 1] == '10'
-    assert argv[argv.index('--limit-rate') + 1] == '2M'
-    assert argv[argv.index('--concurrent-fragments') + 1] == '1'
-    assert argv[-1] == 'https://example.test/watch?v=abc123'
+    assert argv[argv.index('--retries') + 1] == '7'
+    assert argv[argv.index('--sleep-interval') + 1] == '6'
+    assert argv[argv.index('--max-sleep-interval') + 1] == '16'
+    assert argv[argv.index('--sleep-requests') + 1] == '11'
+    assert argv[argv.index('--limit-rate') + 1] == '3M'
+    assert argv[argv.index('--concurrent-fragments') + 1] == '2'
+    assert argv[-1] == 'https://example.test/abc123'
     assert kwargs['timeout'] == 1800
 
 
 def test_completed_outputs_ignores_ytdlp_fragment_named_like_video(tmp_path: Path) -> None:
     (tmp_path / 'abc.f137.mp4').write_bytes(b'partial')
+    (tmp_path / 'abc Match.f137.mp4').write_bytes(b'partial')
 
     assert downloader._completed_outputs(tmp_path, 'abc') == []
+
+
+def test_video_only_mode_uses_h264_selector_without_ffprobe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidates_path = tmp_path / 'candidates.csv'
+    _write_candidates(candidates_path, [_candidate('silent')])
+    output_dir = tmp_path / 'videos'
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(downloader.shutil, 'which', lambda name: f'/bin/{name}')
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(argv)
+        (output_dir / 'silent.mp4').write_bytes(b'video')
+        return subprocess.CompletedProcess(argv, 0, '', '')
+
+    monkeypatch.setattr(downloader.subprocess, 'run', fake_run)
+    outcomes = downloader.download_all_videos(
+        candidates_path,
+        output_dir,
+        max_workers=1,
+        video_only=True,
+    )
+
+    assert calls[0][calls[0].index('--format') + 1] == downloader._YTDLP_VIDEO_ONLY_FORMAT
+    assert outcomes[0].entry is not None
+    assert outcomes[0].entry['commentary_eligible'] is False
+
+
+def test_legacy_spaced_file_is_completed_output(tmp_path: Path) -> None:
+    legacy_path = tmp_path / '12 Match Name.mp4'
+    legacy_path.write_bytes(b'video')
+
+    assert downloader._completed_outputs(tmp_path, '12') == [legacy_path]
+
+
+def test_video_only_resume_skips_legacy_file_without_creating_exact_name(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidates_path = tmp_path / 'candidates.csv'
+    _write_candidates(candidates_path, [_candidate('12')])
+    output_dir = tmp_path / 'videos'
+    output_dir.mkdir()
+    legacy_path = output_dir / '12 Match Name.mp4'
+    legacy_path.write_bytes(b'video')
+
+    monkeypatch.setattr(downloader.shutil, 'which', lambda name: f'/bin/{name}')
+
+    def fail_download(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f'yt-dlp must not run: {args}, {kwargs}')
+
+    monkeypatch.setattr(downloader.subprocess, 'run', fail_download)
+    outcomes = downloader.download_all_videos(
+        candidates_path,
+        output_dir,
+        max_workers=1,
+        video_only=True,
+    )
+
+    assert outcomes[0].filename == legacy_path.name
+    assert not (output_dir / '12.mp4').exists()
+    with (output_dir / 'sources.toml').open('rb') as handle:
+        entry = tomllib.load(handle)['videos'][legacy_path.name]
+    assert entry['commentary_eligible'] is False
+
+
+def test_exact_and_legacy_outputs_are_ambiguous(tmp_path: Path) -> None:
+    (tmp_path / '12.mp4').write_bytes(b'video')
+    (tmp_path / '12 Match Name.mp4').write_bytes(b'video')
+    task = ('https://example.test/12', '12', 'Match Name', tmp_path)
+
+    with pytest.raises(RuntimeError, match='multiple completed outputs'):
+        downloader._download_one(
+            task,
+            allow_missing_audio=False,
+            video_only=True,
+            existing_videos={},
+        )
 
 
 def test_audio_verified_download_writes_truthful_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -365,7 +456,8 @@ def test_manifest_round_trip_preserves_rich_strings_and_unknown_scalars(
     [
         ('[videos."clip.mp4"\n', tomllib.TOMLDecodeError),
         ('dataset = "scraped"\nvideos = []\n', TypeError),
-        ('dataset = "other"\n[videos]\n', ValueError),
+        ('dataset = 7\n[videos]\n', TypeError),
+        ('dataset = ""\n[videos]\n', ValueError),
         ('dataset = "scraped"\nfuture = [1, 2]\n[videos]\n', TypeError),
     ],
 )
@@ -406,6 +498,42 @@ def test_empty_selected_input_writes_empty_manifest_and_exits_zero(tmp_path: Pat
     assert manifest == {'dataset': 'scraped', 'videos': {}}
 
 
+def test_cli_writes_explicit_dataset_label(tmp_path: Path, monkeypatch) -> None:
+    candidates_path = tmp_path / 'candidates.csv'
+    _write_candidates(candidates_path, [])
+    output_dir = tmp_path / 'videos'
+
+    monkeypatch.setattr(
+        'sys.argv',
+        [
+            'download_scraped_videos',
+            '--candidates-csv', str(candidates_path),
+            '--output-dir', str(output_dir),
+            '--dataset', 'shuttleset',
+        ],
+    )
+
+    assert downloader.main() == 0
+    with (output_dir / 'sources.toml').open('rb') as handle:
+        manifest = tomllib.load(handle)
+    assert manifest == {'dataset': 'shuttleset', 'videos': {}}
+
+
+def test_existing_manifest_dataset_must_match_requested_label(tmp_path: Path) -> None:
+    candidates_path = tmp_path / 'candidates.csv'
+    _write_candidates(candidates_path, [])
+    output_dir = tmp_path / 'videos'
+    output_dir.mkdir()
+    manifest_path = output_dir / 'sources.toml'
+    manifest_text = 'dataset = "shuttleset"\n\n[videos]\n'
+    manifest_path.write_text(manifest_text, encoding='utf-8')
+
+    with pytest.raises(ValueError, match="expected 'scraped'"):
+        downloader.download_all_videos(candidates_path, output_dir)
+
+    assert manifest_path.read_text(encoding='utf-8') == manifest_text
+
+
 def test_probe_audio_pins_full_argv_timeout_and_exact_path(tmp_path: Path, monkeypatch) -> None:
     video_path = tmp_path / 'abc.mkv'
     video_path.write_bytes(b'video')
@@ -443,6 +571,7 @@ def test_multiple_completed_video_extensions_fail_loudly(tmp_path: Path) -> None
         downloader._download_one(
             task,
             allow_missing_audio=True,
+            video_only=False,
             existing_videos={},
         )
 
@@ -505,6 +634,53 @@ def test_existing_false_entry_is_not_reprobed_or_counted(
     assert not outcomes[0].failed
 
 
+def test_accept_silent_video_reprobes_false_entry_until_readable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidates_path = tmp_path / 'candidates.csv'
+    _write_candidates(candidates_path, [_candidate('existing')])
+    output_dir = tmp_path / 'videos'
+    output_dir.mkdir()
+    video_path = output_dir / 'existing.mp4'
+    video_path.write_bytes(b'broken')
+    manifest_path = output_dir / 'sources.toml'
+    manifest_path.write_text(
+        'dataset = "scraped"\n\n'
+        '[videos."existing.mp4"]\n'
+        'video_id = "existing"\n'
+        'title = "Title existing"\n'
+        'url = "https://example.test/existing"\n'
+        'commentary_eligible = false\n',
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(downloader.shutil, 'which', lambda name: f'/bin/{name}')
+
+    def probe(path: Path) -> bool:
+        if path.read_bytes() == b'broken':
+            raise downloader._UnreadableMedia('fixture media failure')
+        return False
+
+    monkeypatch.setattr(downloader, '_probe_audio', probe)
+    first = downloader.download_all_videos(
+        candidates_path,
+        output_dir,
+        max_workers=1,
+        accept_silent_video=True,
+    )
+    video_path.write_bytes(b'readable silent video')
+    second = downloader.download_all_videos(
+        candidates_path,
+        output_dir,
+        max_workers=1,
+        accept_silent_video=True,
+    )
+
+    assert first[0].failed
+    assert not second[0].failed
+
+
 def test_unexpected_worker_exception_propagates_after_sibling_manifest_update(
     tmp_path: Path,
     monkeypatch,
@@ -521,9 +697,11 @@ def test_unexpected_worker_exception_propagates_after_sibling_manifest_update(
         task: tuple[str, str, str, Path],
         *,
         allow_missing_audio: bool,
+        video_only: bool,
         existing_videos: dict[str, object],
+        accept_silent_video: bool = False,
     ) -> downloader.DownloadOutcome:
-        del allow_missing_audio, existing_videos
+        del allow_missing_audio, video_only, existing_videos, accept_silent_video
         url, video_id, title, _output_dir = task
         called_ids.append(video_id)
         if video_id == 'boom':
@@ -598,6 +776,17 @@ def test_fewer_than_half_failed_seeds_exit_zero(tmp_path: Path, monkeypatch) -> 
     assert exit_code == 0
 
 
+def test_main_uses_the_configured_failure_fraction(tmp_path: Path, monkeypatch) -> None:
+    rows = [_candidate(f'v{index}') for index in range(4)]
+    monkeypatch.setattr(downloader.config, 'DOWNLOAD_FAIL_FRACTION_BLOCK', 0.75)
+
+    exit_code, _called_ids, _manifest_path = _run_main_with_fake_outcomes(
+        tmp_path, monkeypatch, rows, {'v0', 'v1'},
+    )
+
+    assert exit_code == 0
+
+
 def test_mass_failure_denominator_excludes_unkept_rows(tmp_path: Path, monkeypatch) -> None:
     rows = [_candidate('excluded', keep='False'), _candidate('failed'), _candidate('good')]
 
@@ -665,3 +854,59 @@ def test_produced_mkv_uses_actual_basename_and_ignores_stale_manifest_file(
         videos = tomllib.load(handle)['videos']
     assert 'abc.mkv' in videos
     assert 'abc.mp4' in videos
+
+
+def test_explicit_selected_ids_override_keep_without_mutating_candidates(tmp_path: Path) -> None:
+    rows = [
+        {'video_id': 'first', 'url': 'https://x/first', 'title': 'First', 'keep': 'False'},
+        {'video_id': 'second', 'url': 'https://x/second', 'title': 'Second', 'keep': ''},
+        {'video_id': 'third', 'url': 'https://x/third', 'title': 'Third', 'keep': 'True'},
+    ]
+
+    tasks = downloader._tasks_from_rows(rows, tmp_path, {'second', 'first'})
+
+    assert [task[1] for task in tasks] == ['first', 'second']
+    assert [row['keep'] for row in rows] == ['False', '', 'True']
+
+
+def test_explicit_selected_ids_reject_unknown_or_duplicate_values(tmp_path: Path) -> None:
+    rows = [{'video_id': 'known', 'url': 'https://x/known', 'title': 'Known', 'keep': ''}]
+
+    with pytest.raises(ValueError, match='absent from candidates'):
+        downloader._tasks_from_rows(rows, tmp_path, {'missing'})
+    with pytest.raises(ValueError, match='duplicate values'):
+        downloader._tasks_from_rows(rows, tmp_path, ['known', 'known'])
+    with pytest.raises(ValueError, match='not one string'):
+        downloader._tasks_from_rows(rows, tmp_path, 'known')
+
+
+def test_explicit_selection_can_keep_a_verified_silent_visual_source(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidates_path = tmp_path / 'candidates.csv'
+    _write_candidates(candidates_path, [_candidate('silent')])
+    output_dir = tmp_path / 'videos'
+
+    monkeypatch.setattr(downloader.shutil, 'which', lambda name: f'/bin/{name}')
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        (output_dir / 'silent.mp4').write_bytes(b'silent')
+        return subprocess.CompletedProcess(argv, 0, '', '')
+
+    monkeypatch.setattr(downloader.subprocess, 'run', fake_run)
+    monkeypatch.setattr(downloader, '_probe_audio', lambda _path: False)
+
+    outcomes = downloader.download_all_videos(
+        candidates_path,
+        output_dir,
+        max_workers=1,
+        selected_video_ids=['silent'],
+        accept_silent_video=True,
+    )
+
+    assert not outcomes[0].failed
+    assert (output_dir / 'silent.mp4').is_file()
+    assert outcomes[0].entry is not None
+    assert outcomes[0].entry['commentary_eligible'] is False

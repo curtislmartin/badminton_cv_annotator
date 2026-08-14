@@ -6,7 +6,7 @@
 # BST training script for ShuttleSet.
 #
 # Run from the repo root with both package roots on PYTHONPATH:
-#   PYTHONPATH=src/bst_x \
+#   PYTHONPATH=src:src/bst_x \
 #       python -m bst_x_train
 
 import numpy as np
@@ -39,10 +39,9 @@ from result_utils import show_f1_results, plot_confusion_matrix
 from pipeline.config import (
     CLIP_WINDOW,
     COCO_N_JOINTS,
-    Taxonomy,
     derive_npy_collated_dir_basename,
-    taxonomy_lookup,
 )
+from classifier_shared.taxonomy import Taxonomy, taxonomy_lookup
 from pipeline.data_access import load_repo_dotenv, resolve_collated_data_root
 from run_tracker import track_run, track_serial
 from bst_x_common import (

@@ -148,7 +148,7 @@ class BST(nn.Module):
     The old variant flags (use_ppf / use_cg / use_ap) and the four unused partials
     they fed came out once CG and AP went always-on. Their wiring, and what
     re-adding a variant would touch, lives in
-    docs/architecture_notes/completed_general_refactors/structure_and_guards_pass/bst_variant_flags_design.md.
+    docs/archive/completed_general_refactors/structure_and_guards_pass/bst_variant_flags_design.md.
     '''
     def __init__(
         self, in_dim, seq_len, n_classes, n_players=2,
@@ -428,7 +428,7 @@ BST_CG_AP = BST
 
 
 if __name__ == '__main__':
-    from pipeline.config import taxonomy_lookup
+    from classifier_shared.taxonomy import taxonomy_lookup
     n_classes = taxonomy_lookup('une_v1_14').n_classes
 
     b, t, n_players = 1, 100, 2

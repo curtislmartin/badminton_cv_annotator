@@ -7,17 +7,36 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from annotator.validation_overlay.core.cli import compose_frames, make_render_plan, render
-from annotator.validation_overlay.core.decode import fetch_span, probe_video
+from annotator.validation_overlay.core.decode import iter_span_frames
 from annotator.validation_overlay.core.timeline import Segment
-from annotator.validation_overlay.overlays.shuttle_track import BOX_COLOUR, make_draw
+from annotator.validation_overlay.overlays.shuttle_track import BOX_COLOUR, load_track, make_draw
+from annotator.video_metadata import probe_video_metadata
+
+
+def test_shuttle_loader_applies_shared_visibility_and_coordinate_contract(tmp_path: Path) -> None:
+    valid_path = tmp_path / "valid.npy"
+    valid = np.array([[0.0, 1.0, 1.0], [4.0, -3.0, 0.0]])
+    np.save(valid_path, valid, allow_pickle=False)
+
+    np.testing.assert_array_equal(load_track(valid_path, 2), valid)
+
+    for name, invalid, reason in (
+        ("visibility", np.array([[0.5, 0.5, 0.5]]), "visibility"),
+        ("coordinates", np.array([[1.01, 0.5, 1.0]]), r"within \[0, 1\]"),
+    ):
+        path = tmp_path / f"{name}.npy"
+        np.save(path, invalid, allow_pickle=False)
+        with pytest.raises(ValueError, match=reason):
+            load_track(path, 1)
 
 
 def test_composed_stream_pairs_every_source_frame_and_marks_before_encoding(
     validation_video: Path, tmp_path: Path
 ) -> None:
-    info = probe_video(validation_video)
+    info = probe_video_metadata(validation_video)
     segments = (Segment(1, 2, "one"), Segment(5, 6, "two"))
     plan = make_render_plan(
         info,
@@ -30,7 +49,9 @@ def test_composed_stream_pairs_every_source_frame_and_marks_before_encoding(
         spacer=Fraction(2, 25),
     )
     expected_indices = [0, 1, 2, 3, None, None, 4, 5, 6, 7]
-    expected_source = fetch_span(validation_video, 0, 7, info.fps)
+    expected_source = np.stack(list(iter_span_frames(
+        validation_video, 0, 7, info.fps, info.width, info.height,
+    )))
     observed: list[tuple[int, bool]] = []
     mark_counts: list[int] = []
 
@@ -79,12 +100,15 @@ def test_shuttle_marks_track_their_own_source_row_when_upscaled(
     four times the source width and checks, on every frame, that the box centre
     sits where that frame's own track row puts it.
     """
-    info = probe_video(validation_video)
+    info = probe_video_metadata(validation_video)
     # One distinct position per source frame, spread across the lower half so the
     # HUD block (drawn afterwards, top-left) can never sit on top of a box.
-    span = info.nb_frames - 1
+    span = info.frame_count - 1
     track = np.array(
-        [[0.15 + 0.70 * index / span, 0.55 + 0.35 * index / span, 1.0] for index in range(info.nb_frames)]
+        [
+            [0.15 + 0.70 * index / span, 0.55 + 0.35 * index / span, 1.0]
+            for index in range(info.frame_count)
+        ]
     )
     plan = make_render_plan(
         info,

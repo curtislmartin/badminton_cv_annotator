@@ -14,15 +14,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from annotator.shuttle_track import validate_shuttle_track
 from annotator.validation_overlay.core.cli import (
     DrawFn,
     build_shared_parser,
     make_render_plan,
     render,
 )
-from annotator.validation_overlay.core.decode import probe_video
 from annotator.validation_overlay.core.hud import HudStyle, draw_mark_label
 from annotator.validation_overlay.core.timeline import read_segments
+from annotator.video_metadata import probe_video_metadata
 
 
 BOX_COLOUR = (240, 16, 255)
@@ -44,18 +45,7 @@ def load_track(track_path: Path, nb_frames: int) -> np.ndarray:
     if not track_path.is_file():
         raise FileNotFoundError(f"track is not a regular file: {track_path}")
     track = np.load(track_path, allow_pickle=False)
-    if track.shape != (nb_frames, 3):
-        raise ValueError(
-            f"track shape {track.shape} does not match video frame count {nb_frames} as (n_frames, 3)"
-        )
-    if not np.issubdtype(track.dtype, np.floating):
-        raise ValueError(f"track dtype must be floating, got {track.dtype}")
-    if not np.isfinite(track).all():
-        raise ValueError("track contains non-finite values")
-    tracked = track[:, 2] == 1.0
-    coordinates = track[tracked, :2]
-    if ((coordinates < 0.0) | (coordinates > 1.0)).any():
-        raise ValueError("tracked x and y coordinates must be within [0, 1]")
+    validate_shuttle_track(track, nb_frames)
     return track
 
 
@@ -100,15 +90,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Validate inputs, render the selected spans and return a process status."""
     args = build_parser().parse_args(argv)
     try:
-        info = probe_video(args.video)
+        info = probe_video_metadata(args.video)
         segments = read_segments(
             args.segments,
-            info.nb_frames,
+            info.frame_count,
             start_col=args.start_col,
             end_col=args.end_col,
             label_col=args.label_col,
         )
-        track = load_track(args.track, info.nb_frames)
+        track = load_track(args.track, info.frame_count)
         plan = make_render_plan(
             info,
             segments,

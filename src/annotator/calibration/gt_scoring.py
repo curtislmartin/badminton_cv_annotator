@@ -12,24 +12,35 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
+from annotator.fps_constants import ScalingKind
 from annotator.calibration.fixtures import (
-    FIXTURES, REPO_ROOT, SHARED_FILES, Fixture, fixtures_root, verify_file, verify_fixture,
+    FIXTURES, REPO_ROOT, SHARED_FILES, Fixture, fixtures_root, verify_file,
+    verify_run_video_fixture,
 )
 from annotator.run_video import AnnotatorResult, run_video
 from annotator.inpaint_guard import code_counts, grade_track
 from annotator import point_winner
-from annotator.point_winner import Half, LandingFilterOptions, OTHER_HALF, Verdict
+from annotator.point_winner import Half, OTHER_HALF, SHIPPED_LANDING_FILTER_OPTIONS, Verdict
 from annotator.replay_mask import _read_homography_rows
 from annotator.calibration.scoring import (
-    RallyBoundary, classify_all, greedy_match, load_gt_rallies, score_boundaries, score_contacts,
+    CANONICAL_CONTACT_TOLERANCE_BASE30,
+    RallyBoundary,
+    classify_all,
+    greedy_match,
+    load_gt_rallies,
+    safe_f1,
+    score_boundaries,
+    score_contacts,
 )
 from shared.court import load_all_court_info
 
 log = logging.getLogger(__name__)
 
 
-# Re-pinned after the measured W2.9 default flip (eee3e29). The reviewed
-# pre/post record is in the W2.9 Opus-checkpoint artefact. Floors read from here.
+# Re-pinned after the measured 2026-07-28 smoothing and re-entry default change
+# (eee3e29). The tracked pre/post record is in
+# docs/archive/completed_general_refactors/annotator_cleanup/w2_9_delta.diff.
+# Floors read from here.
 REFERENCE_SCORES = {
     'sset_01': {
         'covered_fraction': 0.9734513274336283,
@@ -293,6 +304,14 @@ class Reconciliation(NamedTuple):
 
 
 class RallyRow(NamedTuple):
+    """One ground-truth rally's boundary mapping and column-level scores.
+
+    Identity and boundary fields run from ``gt_index`` through ``mapped_span``.
+    Ball-round and timing fields compare stroke counts and matched frame error.
+    Player, server, hit-height, getpoint, and landing fields then hold each
+    column's eligible ground truth, prediction, and correctness values.
+    """
+
     gt_index: int
     set_id: str
     rally: int
@@ -323,6 +342,12 @@ class RallyRow(NamedTuple):
 
 
 class ColumnAgg(NamedTuple):
+    """Correct and eligible counts for primary and covered-only views.
+
+    Primary totals include every eligible ground-truth item. Secondary totals
+    include only items whose rally has a covered boundary mapping.
+    """
+
     primary_correct: int
     primary_total: int
     secondary_correct: int
@@ -330,6 +355,14 @@ class ColumnAgg(NamedTuple):
 
 
 class VideoScoring(NamedTuple):
+    """All per-video calibration rows, aggregates, counts, and diagnostics.
+
+    ``rows`` and ``boundary_metrics`` retain rally-level and boundary results.
+    ``ColumnAgg`` fields and timing pairs hold primary and covered-only counts.
+    Contact totals support precision and recall, while the remaining lists and
+    mappings retain hit-height failures, absolute errors, and verdict details.
+    """
+
     name: str
     rows: list[RallyRow]
     boundary_metrics: dict
@@ -370,7 +403,7 @@ def _ratio(numerator: int, denominator: int) -> float | None:
 
 
 def canonical_tolerance(fps: float) -> int:
-    return max(1, math.floor(5.0 * fps / 30.0 + 0.5))
+    return int(ScalingKind.FRAME_COUNT.scale(CANONICAL_CONTACT_TOLERANCE_BASE30, fps))
 
 
 def _norm_half(side: str) -> str:
@@ -378,7 +411,7 @@ def _norm_half(side: str) -> str:
 
 
 def load_fixture_arrays(fixture: Fixture) -> tuple[np.ndarray, ...]:
-    verify_fixture(fixture)
+    verify_run_video_fixture(fixture)
     root = fixtures_root()
     return (
         np.load(root / fixture.track_path), np.load(root / fixture.pose_path("bboxes")),
@@ -432,7 +465,7 @@ def build_run_video_inputs(fixture: Fixture) -> RunVideoInputs:
         raise ValueError(f"{fixture.name}: homography_rows are missing or empty")
     keyword: dict[str, object] = {
         "fps": fixture.fps,
-        "landing_options": LandingFilterOptions(7, 0.004, 5, 7, 0.75),
+        "landing_options": SHIPPED_LANDING_FILTER_OPTIONS,
         "net_band": fixture.net_band,
         "resolution": fixture.resolution,
         "video_id": fixture.video_id,
@@ -668,7 +701,7 @@ def flatten_metrics(scoring: VideoScoring) -> dict[str, int | float | None]:
         values.update({f"{name}_recall": _ratio(*pair), f"{name}_matched": pair[0], f"{name}_total": pair[1]})
     precision = _ratio(scoring.contact_matches, scoring.contact_filtered_total)
     recall = _ratio(scoring.contact_matches, scoring.contact_gt_total)
-    f1 = None if precision is None or recall is None else (0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall))
+    f1 = None if precision is None or recall is None else safe_f1(precision, recall)
     values.update(contact_f1=f1, contact_precision=precision, contact_recall=recall, contact_matches=scoring.contact_matches, contact_filtered_total=scoring.contact_filtered_total, contact_gt_total=scoring.contact_gt_total, n_raw_contacts=scoring.n_raw_contacts, n_filtered_contacts=scoring.n_filtered_contacts, hit_height_failures=len(scoring.hit_height_failures))
     return values
 
@@ -680,26 +713,6 @@ def render_table(scores: dict[str, dict[str, int | float | None]], references=RE
         for metric in DISPLAY_METRICS:
             lines.append(f"{fixture} {metric} {reference.get(metric)!r} {current[metric]!r}")
     return "\n".join(lines)
-
-
-# Below 0.75x reference reads as a miswired chain, not tuning debt (ruled 2026-07-18,
-# raised from the drafted 0.5).
-FLOOR_MULTIPLIER = 0.75
-
-
-def assert_floors(fixture: Fixture, metrics: dict[str, int | float | None]) -> None:
-    if REFERENCE_SCORES is None:
-        raise AssertionError("REFERENCE_SCORES is not captured")
-    for metric in ("covered_fraction", "contact_f1"):
-        reference = REFERENCE_SCORES[fixture.name][metric]
-        current = metrics[metric]
-        if not isinstance(reference, (int, float)) or not math.isfinite(reference) or reference < 0:
-            raise AssertionError(f"invalid reference {fixture.name} {metric}: {reference!r}")
-        if not isinstance(current, (int, float)) or not math.isfinite(current):
-            raise AssertionError(f"invalid current {fixture.name} {metric}: {current!r}")
-        if current < FLOOR_MULTIPLIER * reference:
-            raise AssertionError(
-                f"{fixture.name} {metric}: {current!r} < floor {FLOOR_MULTIPLIER * reference!r}")
 
 
 def run_fixture(

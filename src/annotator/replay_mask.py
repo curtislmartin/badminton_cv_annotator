@@ -1,4 +1,6 @@
-"""Stage 9: replay and off-rally mask (scraper_spec.md section 7).
+"""Build the replay and off-rally mask.
+
+See ``docs/scraper_pipeline/scraper_architecture.md`` for the pipeline context.
 
 Three independent per-frame boolean signals unioned into one `(frames,)` mask,
 true where the frame is a replay or otherwise off-rally. Saved per video to
@@ -10,7 +12,7 @@ missing input contributes an all-False mask with a log line rather than killing
 the union: an absent court mask must not veto a real perspective-shift replay.
 
 Speed and its helpers come from the shared annotator declarations, re-exported
-by stage 8. The slow-motion signal therefore reads the same per-frame speed as
+by rally segmentation. The slow-motion signal therefore reads the same per-frame speed as
 the rally rules, not a second definition.
 
 Run as `python -m annotator.replay_mask --video-id ...` with PYTHONPATH=src.
@@ -50,12 +52,11 @@ HOMOGRAPHY_CORNER_COLS = [
 # Signal 1: court absence
 # ---------------------------------------------------------------------------
 def court_absence_signal(court_present: np.ndarray | None, n_frames: int, fps: float) -> np.ndarray:
-    """Fire across any court-absent run of at least COURT_ABSENT_WINDOW frames.
+    """Fire across court-absent runs that reach the fps-scaled window.
 
     A sustained absence (>= the window) masks its whole run; a one- or two-frame
-    detector blip does not. This reads the spec's "court-present false across a
-    window" as a run-length gate, which masks the entire absence rather than a
-    single window-sized slice of it.
+    detector blip does not. The run-length gate masks the entire sustained
+    absence rather than a single window-sized slice.
 
     :param court_present: `(frames,)` bool court-present flag, or None.
     :param n_frames: video frame count (the mask length).
@@ -104,9 +105,8 @@ def perspective_shift_signal(homography_rows: list[dict] | None, n_frames: int) 
     from it (normalised by the reference court's bounding-box diagonal) exceeds
     PERSPECTIVE_SHIFT_THRESHOLD is a replay or cutaway angle and its frames fire.
 
-    Comparing every segment to the dominant view (not to its neighbour) realises
-    the spec's adjacent-shift intent without masking the whole tail after one
-    legitimate camera change: it is the deviant minority view that is the replay,
+    Comparing every segment to the dominant view avoids masking the whole tail
+    after one legitimate camera change. The deviant minority view is the replay,
     and the normalisation is self-contained (diagonal of the reference corners),
     so no frame resolution is needed.
 
@@ -171,7 +171,7 @@ def velocity_drop_signal(
     the shuttle is visible. Invisible frames are the court-absence signal's job.
     Genuine rest (below REST_SPEED) deliberately does NOT fire: a resting
     shuttle is the between-rallies state, and that is exactly where the
-    commentary stage 11 pairs with lives; masking rest would hold every
+    commentary pairing joins with live spans; masking rest would hold every
     post-rally chunk out of pairing. Slow motion means moving, slowly.
 
     Speed steps touching a non_evidence frame are unmeasured: they feed neither the baseline nor the rolling median; edge frames of a graded run can still fire on neighbouring measured evidence, and a window with no measured step reads not-slow.
@@ -230,7 +230,7 @@ def combine_mask(
     fps: float,
     *, non_evidence: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Union the three replay/off-rally signals (any-of, the spec's default).
+    """Union the three replay/off-rally signals using an any-of rule.
 
     :return: `(n_frames,)` bool mask, True where any signal fires.
     """
@@ -300,7 +300,7 @@ def _cli_non_evidence(track: np.ndarray | None) -> np.ndarray | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Stage 9: replay/off-rally mask for one video.')
+    parser = argparse.ArgumentParser(description='Replay masking: replay/off-rally mask for one video.')
     parser.add_argument('--video-id', required=True)
     parser.add_argument('--shuttle', type=Path, default=None,
                         help='<video_id>.npy (t, 3) shuttle track')

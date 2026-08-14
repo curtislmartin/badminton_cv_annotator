@@ -62,7 +62,7 @@ What this does:
   satisfies `requires-python = ">=3.11"`.
 - Installs the **shared base** (always): torch, torchvision, numpy,
   pandas, scipy, opencv-python, Pillow, tqdm, parse, pycocotools,
-  pyyaml, fastapi, uvicorn, python-multipart.
+  pyyaml, jaxtyping, beartype, frozendict, and pyrefly.
 - Installs the **`bric` extras** on top: ultralytics, transformers,
   torcheval (combines `bric-runtime` + `bric-train`). R(2+1)D-18 ships
   in torchvision (a base dep) so no extra ML lib is needed beyond
@@ -124,8 +124,8 @@ This script checks:
 5. R(2+1)D-18 forward pass on the accelerator (Kinetics-400 pretrained,
    `torchvision.models.video`)
 6. OpenCV importable
-7. BRIC's own modules (`shared.taxonomy`, `shared.court`,
-   `shared.video_io`) import cleanly
+7. BRIC's own modules (`classifier_shared.taxonomy`, `shared.court`,
+   `classifier_shared.video_io`) import cleanly
 
 Expected output ends with:
 

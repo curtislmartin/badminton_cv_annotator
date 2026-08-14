@@ -3,14 +3,38 @@ import pandas as pd
 import pytest
 
 from annotator.calibration.scoring import (
-    GtRally, RallyBoundary, classify_rally_boundary, greedy_match,
-    load_gt_rallies, merged_span_indices, score_boundaries, score_contacts,
-    score_stage8,
+    CANONICAL_CONTACT_TOLERANCE_BASE30,
+    CONTACT_TOLERANCES_BASE30,
+    GtRally,
+    RallyBoundary,
+    classify_rally_boundary,
+    greedy_match,
+    load_gt_rallies,
+    merged_span_indices,
+    safe_f1,
+    score_boundaries,
+    score_contacts,
 )
 
 
 def _rally(set_id: str, rally: int, frames: tuple[int, ...]) -> GtRally:
     return GtRally(set_id=set_id, rally=rally, stroke_frames=frames)
+
+
+def test_contact_tolerances_keep_the_persisted_base30_order() -> None:
+    assert CANONICAL_CONTACT_TOLERANCE_BASE30 == 5
+    assert CONTACT_TOLERANCES_BASE30 == (1, 2, 5, 10)
+
+
+@pytest.mark.parametrize(
+    ('precision', 'recall'),
+    ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (0.25, 0.5), (2 / 3, 1.0)),
+)
+def test_safe_f1_matches_every_former_formula(precision: float, recall: float) -> None:
+    denominator = precision + recall
+    precision_first = 0.0 if denominator == 0 else 2 * precision * recall / denominator
+    recall_first = 0.0 if denominator == 0 else 2 * recall * precision / denominator
+    assert safe_f1(precision, recall) == precision_first == recall_first
 
 
 def test_covered_all_strokes_in_one_span():
@@ -145,14 +169,6 @@ def test_per_set_breakdown_splits_by_set_id():
     assert per_set['set2']['count_gate_covered']['pass'] == 0
     assert per_set['set1']['tolerances']['2']['matched'] == 2
     assert per_set['set2']['tolerances']['2']['matched'] == 1
-
-
-def test_score_stage8_shape():
-    rally = _rally('set1', 1, (10, 12, 14))
-    result = score_stage8([(8, 20)], [(0, 10, None), (0, 12, None), (0, 14, None)], [rally], tolerances=(1, 2))
-    assert result['n_gt_rallies'] == 1 and result['tolerances'] == [1, 2]
-    assert set(result['boundaries']) >= {'covered', 'merged_spans', 'spurious_spans'}
-    assert set(result['contacts']) == {'count_gate', 'tolerances', 'precision_raw', 'per_set'}
 
 
 def test_load_gt_rallies_groups_and_filters_vid():

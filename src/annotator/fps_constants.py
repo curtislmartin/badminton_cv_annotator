@@ -7,16 +7,34 @@ are assumed CFR; :func:`probe_fps` rejects variable-frame-rate files loudly.
 """
 from __future__ import annotations
 
-import json
 import math
-import subprocess
-from dataclasses import dataclass
-from fractions import Fraction
+from dataclasses import dataclass, fields
+from enum import StrEnum
 from pathlib import Path
+
+from annotator.video_metadata import probe_video_fps
 
 BASE_FPS = 30.0
 REST_SPEED_BASE30 = 0.002
 START_SPEED_BASE30 = 0.015
+
+
+class ScalingKind(StrEnum):
+    """Describe how a base-30 value scales with the video's frame rate."""
+
+    PER_FRAME_SPEED = 'per_frame_speed'
+    FRAME_COUNT = 'frame_count'
+    DIMENSIONLESS = 'dimensionless'
+
+    def scale(self, value: float, fps: float) -> float | int:
+        """Scale one base-30 value, requiring a positive finite frame rate."""
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError(f'fps must be positive and finite, got {fps!r}')
+        if self is ScalingKind.PER_FRAME_SPEED:
+            return value * BASE_FPS / fps
+        if self is ScalingKind.FRAME_COUNT:
+            return max(1, math.floor(value * fps / BASE_FPS + 0.5))
+        return value
 
 
 @dataclass(frozen=True)
@@ -52,8 +70,7 @@ class FpsConstants:
     reentry_min_visible_frames: int
 
 
-def _time(base30: float, fps: float) -> int:
-    return max(1, math.floor(base30 * fps / BASE_FPS + 0.5))
+FPS_CONSTANT_FIELD_NAMES = frozenset(field.name for field in fields(FpsConstants))
 
 
 def scale_for_fps(fps: float, overrides_base30: dict[str, float] | None = None) -> FpsConstants:
@@ -62,10 +79,10 @@ def scale_for_fps(fps: float, overrides_base30: dict[str, float] | None = None) 
         raise ValueError(f'fps must be positive and finite, got {fps!r}')
     base30 = {} if overrides_base30 is None else overrides_base30
     def frame_count(name: str, shipped: float) -> int:
-        return _time(base30.get(name, shipped), fps)
+        return int(ScalingKind.FRAME_COUNT.scale(base30.get(name, shipped), fps))
 
     def speed(name: str, shipped: float) -> float:
-        return base30.get(name, shipped) * BASE_FPS / fps
+        return float(ScalingKind.PER_FRAME_SPEED.scale(base30.get(name, shipped), fps))
 
     return FpsConstants(
         rest_speed=speed('rest_speed', REST_SPEED_BASE30),
@@ -90,19 +107,5 @@ def scale_for_fps(fps: float, overrides_base30: dict[str, float] | None = None) 
 
 
 def probe_fps(video_path: Path) -> float:
-    """Read a CFR rate with ffprobe, rejecting missing, invalid, and VFR streams."""
-    try:
-        completed = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
-             'stream=r_frame_rate,avg_frame_rate', '-of', 'json', str(video_path)],
-            check=True, capture_output=True, text=True,
-        )
-        stream = json.loads(completed.stdout)['streams'][0]
-        rates = [float(Fraction(stream[key])) for key in ('r_frame_rate', 'avg_frame_rate')]
-    except (KeyError, IndexError, ValueError, ZeroDivisionError, json.JSONDecodeError, subprocess.CalledProcessError) as exc:
-        raise ValueError(f'{video_path}: ffprobe could not read a valid video fps') from exc
-    if any(not math.isfinite(rate) or rate <= 0 for rate in rates):
-        raise ValueError(f'{video_path}: ffprobe returned a missing or invalid fps')
-    if abs(rates[0] - rates[1]) > 1e-6:
-        raise ValueError(f'{video_path}: variable frame rate is unsupported')
-    return rates[0]
+    """Return the canonical CFR rate as a float for existing annotator callers."""
+    return float(probe_video_fps(video_path))

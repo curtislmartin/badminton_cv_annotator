@@ -1,4 +1,4 @@
-"""Pure scoring functions for stage-8 rally and contact detection."""
+"""Pure scoring functions for rally and contact detection."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -10,15 +10,17 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from annotator.types import ContactCandidate, ScalingKind
+from annotator.fps_constants import ScalingKind
+from annotator.types import ContactCandidate
 
-DEFAULT_TOLERANCES = (1, 2, 5, 10)
+CANONICAL_CONTACT_TOLERANCE_BASE30 = 5
+CONTACT_TOLERANCES_BASE30 = (1, 2, CANONICAL_CONTACT_TOLERANCE_BASE30, 10)
 
-# Stage 9 replay masking is not applied in sset_01, so replay spans (which
+# Replay masking is not applied in sset_01, so replay spans (which
 # carry no GT strokes) count as spurious by design. Surfaced in the output so a
 # reader does not misread the spurious count as pure false positives.
 SPURIOUS_NOTE = (
-    'stage 9 replay masking not applied in sset_01; replays inflate the '
+    'replay masking not applied in sset_01; replays inflate the '
     'spurious-span count by design'
 )
 
@@ -51,6 +53,12 @@ class GtRally(NamedTuple):
     @property
     def n_strokes(self) -> int:
         return len(self.stroke_frames)
+
+
+def safe_f1(precision: float, recall: float) -> float:
+    """Return the harmonic mean, including zero when both inputs are zero."""
+    denominator = precision + recall
+    return 0.0 if denominator == 0 else 2 * precision * recall / denominator
 
 
 # ---------------------------------------------------------------------------
@@ -433,12 +441,7 @@ def _prf(matched: int, n_gt: int, n_candidates: int) -> dict:
     """Recall/precision/F1 from raw counts; None where a denominator is zero."""
     recall = matched / n_gt if n_gt else None
     precision = matched / n_candidates if n_candidates else None
-    if recall is None or precision is None:
-        f1 = None
-    elif recall + precision == 0:
-        f1 = 0.0
-    else:
-        f1 = 2 * precision * recall / (precision + recall)
+    f1 = None if recall is None or precision is None else safe_f1(precision, recall)
     return {
         'recall': recall,
         'precision': precision,
@@ -498,8 +501,9 @@ def _raw_precision_curve(
     (the sweep CSV's committed columns depend on it) more than the one extra pass,
     which is over the overall rally pairs only and cheap next to segmentation.
 
-    :param contacts: detected contacts ``(rally_id, contact_frame, proximity_ok)``;
-        the full list, so spurious-span candidates land in the denominator.
+    :param contacts: detected contacts as
+        ``(rally_id, contact_frame, proximity_ok, wrist_near)``. The full list
+        ensures spurious-span candidates land in the denominator.
     :param rally_pairs: one ``(gt_frames, candidate_frames)`` per rally, the same
         pooled pairs ``_tolerance_curve`` scores.
     :param tolerances: frame tolerances to score at.
@@ -535,7 +539,7 @@ def score_contacts(
     spans: Sequence[tuple[int, int]],
     contacts: Sequence[tuple[int, int, bool | None, bool | None]],
     gt_rallies: Sequence[GtRally],
-    tolerances: Sequence[int] = DEFAULT_TOLERANCES,
+    tolerances: Sequence[int] = CONTACT_TOLERANCES_BASE30,
 ) -> dict:
     """Contact-side metrics: count gate and per-tolerance credit, overall + per set.
 
@@ -548,8 +552,9 @@ def score_contacts(
     frames. The ``_raw_precision_curve`` docstring summarises the detail.
 
     :param spans: detected rally spans.
-    :param contacts: detected contacts as ``(rally_id, contact_frame, proximity_ok)``;
-        ``proximity_ok`` is not used here.
+    :param contacts: detected contacts as
+        ``(rally_id, contact_frame, proximity_ok, wrist_near)``. The two
+        verdict fields are not used here.
     :param gt_rallies: ground-truth rallies for one video.
     :param tolerances: frame tolerances for the credit curve.
     :return: dict of contact metrics (see keys inline).
@@ -613,29 +618,4 @@ def score_contacts(
         'tolerances': _tolerance_curve(all_pairs, tolerances),
         'precision_raw': _raw_precision_curve(contacts, all_pairs, tolerances),
         'per_set': per_set,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Top-level score
-# ---------------------------------------------------------------------------
-def score_stage8(
-    spans: Sequence[tuple[int, int]],
-    contacts: Sequence[tuple[int, int, bool | None, bool | None]],
-    gt_rallies: Sequence[GtRally],
-    tolerances: Sequence[int] = DEFAULT_TOLERANCES,
-) -> dict:
-    """Full stage-8 score for one video: boundary and contact metrics in one dict.
-
-    :param spans: detected rally spans, ``[(start_frame, end_frame), ...]``.
-    :param contacts: detected contacts, ``[(rally_id, contact_frame, proximity_ok), ...]``.
-    :param gt_rallies: ground-truth rallies for the same video.
-    :param tolerances: frame tolerances for the contact credit curve.
-    :return: ``{'n_gt_rallies', 'tolerances', 'boundaries', 'contacts'}``.
-    """
-    return {
-        'n_gt_rallies': len(gt_rallies),
-        'tolerances': list(tolerances),
-        'boundaries': score_boundaries(spans, gt_rallies),
-        'contacts': score_contacts(spans, contacts, gt_rallies, tolerances),
     }

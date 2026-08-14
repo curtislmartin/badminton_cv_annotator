@@ -1,4 +1,4 @@
-# Badminton stroke classification: project overview
+# Badminton CV annotator: project overview
 
 **Current overview, 30 July 2026.** This overview describes the project
 as it stands at repository merge `726b155`. It puts the scraper and
@@ -364,7 +364,8 @@ session terminology.
   landing, serve and wrist-distance logic.
 - The impulse finder, body-unit wrist gate and local suppression form a useful
   contact baseline. Earlier 82.4% recall and 70.1% precision figures remain
-  historical because they are pre-W2.9 and predate contact-selection changes.
+  historical because they predate the 2026-07-28 smoothing and re-entry policy
+  change and later contact-selection changes.
 - The live court path combines CourtKeyNet geometry with an adaptive
   court-surface search area and grayscale Canny/Hough line evidence. It avoids
   a venue-specific fixed colour rule.
@@ -420,7 +421,8 @@ The open problems are more important than the remaining clean-up.
   `run_video`, so later contact and landing logic cannot yet distinguish all
   observed shuttle positions from filled positions.
 - Serve misses and the replay-mask interaction need a current focused rerun.
-  The recorded 136-miss split predates W2.9 and is historical.
+  The recorded 136-miss split predates the 2026-07-28 smoothing and re-entry
+  policy change and is historical.
 - Hit-height inference is poor because image height confounds court depth.
   Landing and winner inference also need work once reliable detected-rally and
   contact inputs are available. Without high-F1 shuttle contact identification to ground reasonable known height estimate events, this is probably a dead end. The height id wiring might just be best ripped out entirely.
@@ -485,6 +487,9 @@ contact and commentary evidence.
 
 - The [repository README](../README.md) gives the classifier, BRIC and web
   application context.
+- The [provisional rally dataset contract](rally_dataset_contract.md) defines
+  record identity, provenance, primitive evidence, and the planned assembly
+  boundary.
 - The [annotator functionality map](scraper_pipeline/annotator_functionality_map.md)
   is the pre-migration target contract.
 - The [annotator measurement history](scraper_pipeline/annotator_measurement_history.md)

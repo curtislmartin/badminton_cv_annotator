@@ -47,7 +47,7 @@ from typing import NamedTuple
 import numpy as np
 
 from pipeline.config import COCO_N_JOINTS
-from pipeline.court_utils import normalize_position, to_court_coordinate
+from shared.court import normalize_position, to_court_coordinate
 
 from .base import (
     DOUBLES_COUNT_MARGIN,
@@ -315,10 +315,6 @@ def pick_one_frame(
         analysis.bboxes,
         analysis.standing_in_court_count,
     )
-
-
-# Compatibility alias for frozen callers; remove at Stage 7.
-_pick_one_frame = pick_one_frame
 
 
 def _run_clip(

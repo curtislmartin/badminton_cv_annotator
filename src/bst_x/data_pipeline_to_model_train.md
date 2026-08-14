@@ -27,22 +27,25 @@ The project uses three separate Python environments so the pipeline, pose-extrac
 
 | Environment | Requirements file | Purpose |
 |---|---|---|
-| **Pipeline** | `pipeline/requirements.txt` | Download videos, generate clips, verify output |
-| **Pose extraction (rtmlib)** | `preparing_data/requirements.txt` | Pose estimation (step 1 of data preparation) |
-| **BST training** | `requirements.txt` | Collation, training, inference. Also shared by TrackNetV3. |
+| **Pipeline** | `src/bst_x/pipeline/requirements.txt` | Download videos, generate clips, verify output |
+| **Pose extraction (rtmlib)** | `src/bst_x/preparing_data/requirements.txt` | Pose estimation (step 1 of data preparation) |
+| **BST training** | `src/bst_x/requirements.txt` | Collation, training, inference. Also shared by TrackNetV3. |
 
 ### Environment setup
 
 ```bash
+# Run this setup and the execution commands below from the repository root.
+export PYTHONPATH=src:src/bst_x
+
 # 1. Pipeline venv
 python3.11 -m venv venv-pipeline
 source venv-pipeline/bin/activate
-pip install -r pipeline/requirements.txt
+pip install -r src/bst_x/pipeline/requirements.txt
 
 # 2. Pose-extraction venv (rtmlib over onnxruntime; no source builds)
 python3.11 -m venv venv-rtmlib
 source venv-rtmlib/bin/activate
-pip install -r preparing_data/requirements.txt
+pip install -r src/bst_x/preparing_data/requirements.txt
 # GPU extract box: swap onnxruntime -> onnxruntime-gpu per the notes in that file.
 # GPU runtime: onnxruntime-gpu SILENTLY falls back to CPU (~10x slower, two red
 # log lines, then it keeps going) unless the dynamic loader can find cuDNN 9 and
@@ -59,7 +62,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 python3.11 -m venv venv-bst-x
 source venv-bst-x/bin/activate
 pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
-pip install -r requirements.txt
+pip install -r src/bst_x/requirements.txt
 ```
 
 ### Execution order
@@ -72,27 +75,22 @@ python -m pipeline.build_dataset --dry-run                # preview
 python -m pipeline.build_dataset --skip-shuttle            # download + clips + verify
 # Optional: shuttle extraction (uses BST venv for TrackNetV3)
 python -m pipeline.build_dataset --skip-download \
-    --tracknet-dir TrackNetV3 \
     --tracknet-python /path/to/venv-bst-x/bin/python
 # Resume after crash (skip completed steps 3-5, run only shuttle extraction)
 python -m pipeline.build_dataset \
     --skip-download --skip-resolution --skip-clips --skip-verify \
-    --tracknet-dir TrackNetV3 \
     --tracknet-python /path/to/venv-bst-x/bin/python
 
 # ── Stage 2: Pose estimation (rtmlib venv) ──────────────────────────
 source venv-rtmlib/bin/activate
 
 # On engelbart, symlink the taxonomy output dir to scratch first (see Stage 2 Setup below).
-# Run from the repo root with both package roots on PYTHONPATH (matches conftest.py for tests).
-export PYTHONPATH=src/bst_x
 
 python -m preparing_data.prepare_train_on_shuttleset \
     --skip-collate                                         # pose only (no shuttle CSV needed)
 
 # ── Stage 3: Collation + training (BST venv) ────────────────────────
 source venv-bst-x/bin/activate
-export PYTHONPATH=src/bst_x
 
 python -m preparing_data.prepare_train_on_shuttleset \
     --skip-pose                                            # collate (reads shuttle npys)
@@ -101,7 +99,7 @@ python -m bst_x_train                     # train (5 serial trials)
 python -m bst_x_infer                     # inference
 ```
 
-The same `PYTHONPATH=src/bst_x` setting is what `conftest.py` inserts for the test suite, so test and production invocation share one resolution layout. Bare-cd invocation (running the training script directly from inside its containing dir) no longer works after the proper-packages refactor.
+The same `PYTHONPATH=src:src/bst_x` roots are inserted by `conftest.py`, so test and production imports use one layout. Bare-cd invocation from inside the script directory is unsupported.
 
 Each stage's output feeds the next. Stages are independently re-runnable — use `--skip-*` flags to avoid repeating completed work. **Important:** after class merge (step 4) has run, always pass `--skip-clips` on re-runs to avoid re-generating clips that were moved into merged folders.
 
@@ -111,20 +109,23 @@ Each stage's output feeds the next. Stages are independently re-runnable — use
 
 ### Stage 1 -- Build the Dataset (`pipeline/`)
 
-The pipeline downloads match videos, cuts them into labeled stroke clips, optionally extracts shuttle trajectories, and verifies the result. All configuration is centralized in `config.py`; the orchestrator `build_dataset.py` runs the steps in sequence.
+The pipeline downloads match videos, cuts them into labeled stroke clips, optionally extracts shuttle trajectories, and verifies the result. BST-X paths and splits live in `config.py`; classifier taxonomies live in `classifier_shared/taxonomy.py`. The orchestrator `build_dataset.py` runs the steps in sequence.
 
 #### Modules
 
 | Module | Role | Key functions / concepts |
 |--------|------|--------------------------|
-| `config.py` | Single source of truth for paths, stroke types, splits, flaw records, and merge rules. Every other pipeline module imports from here. | • `Taxonomy`: frozen dataclass pinning `classes` (the ordered class list), `merge_map`, `has_sides`, `excluded_base_stroke_types`; `n_classes`/`has_unknown` are properties.<br>• `TAXONOMIES`: the six pinned taxonomies (`bst_25`, `bst_24`, `bst_12`, `une_v1_14`, `une_v1_15`, `shuttleset_18`).<br>• `taxonomy_lookup()`: canonical-name lookup; raises `KeyError` for unknown names.<br>• `derive_class_index()`: the single merge + side + exclusion decision, used by the collator.<br>• `UNE_MERGE_V1_MAP` (19 -> 14) + `MERGE_MAP_25` (19 -> 12, paper-faithful `driven_flight -> drive`).<br>• `SPLITS` (excluded videos auto-stripped), `parse_flaw_records()` -> `EXCLUDED_VIDEOS`/`REMOVED_SHOTS`, `EN_TO_ZH`/`ZH_TO_EN` (CSV I/O only), `NOSIDE_FOLDERS`. |
+| `config.py` | BST-X paths, split membership, and pipeline constants. | `SPLITS`, `EXCLUDED_VIDEOS`, `REMOVED_SHOTS`, and `NOSIDE_FOLDERS`. |
+| `classifier_shared/taxonomy.py` | Classifier taxonomy definitions, stroke mappings, and label derivation. | `Taxonomy`, `TAXONOMIES`, `taxonomy_lookup()`, `derive_class_index()`, `UNE_MERGE_V1_MAP`, `MERGE_MAP_25`, and the English/Chinese stroke mappings. |
+| `classifier_shared/dataset.py` | ShuttleSet paths, flaw parsing, split metadata, and clip bounds. | `ANNOTATIONS_DIR`, `FLAW_RECORDS_PATH`, `SPLITS_V2_PATH`, `parse_flaw_records()`, and `compute_clip_bounds()`. |
 | `build_dataset.py` | One-command orchestrator. Runs steps 1-6 in order with CLI flags to skip individual steps (`--skip-download`, `--skip-resolution`, `--skip-clips`, `--skip-verify`, `--skip-shuttle`). `--skip-clips` skips both clip generation (step 3) and class merge (step 4) since they are tightly coupled: the merge moves clips out of their original folders, so re-running step 3 after a merge would re-generate them from video. | `run_pipeline()` (main entry point), `dry_run()` (preview without side effects), `_validate_inputs()` (fail-fast checks before long work). |
-| `download_videos.py` | Downloads 40 ShuttleSet match videos from YouTube via yt-dlp. Also builds a resolution CSV by scanning each video with OpenCV. | `download_all_videos(max_workers)`, `build_resolution_csv()`. Output: `data/shuttleset/raw_video/{id} {match_name}.mp4` and `data/shuttleset/my_raw_video_resolution.csv`. |
+| `download_adapter.py` | Maps ShuttleSet match rows into the scraper-owned yt-dlp downloader. | `download_shuttleset_videos(max_workers)`. New output: `data/shuttleset/raw_video/{id}.mp4`; existing `{id} {match_name}.mp4` files remain readable. |
+| `video_metadata.py` | Builds the resolution CSV by scanning each video with OpenCV. | `build_resolution_csv()`. Output: `data/shuttleset/my_raw_video_resolution.csv`. |
 | `clip_generator.py` | Extracts individual stroke clips from full match videos. Reads ShuttleSet CSV annotations (Chinese column names), maps A/B players to Top/Bottom, filters excluded videos and removed shots, and organizes clips into `{split}/{Player}_{stroke_type}/` folders. | `generate_all_clips()`, `apply_class_merge()` (moves clips from rare subtype folders into their parent type folders per the active taxonomy's merge map). Three clip window modes: `middle_in_a_sec`, `between_2_hits`, `between_2_hits_with_max_limits` (default, clamps to 1.5s each side). |
-| `player_mapping.py` | Maps the A/B player labels in ShuttleSet annotations to Top/Bottom court positions. Handles set-3 court switches. | `get_top_bottom_mapping(video_id, set_num)`. |
+| `classifier_shared/player_mapping.py` | Maps ShuttleSet A/B labels to Top/Bottom court positions. Handles set-3 court switches. | `collect_shots()`, `map_players()`, `find_set3_switch_rally()`. |
 | `verify.py` | Post-generation sanity checks: all splits present, no clips from excluded videos, no removed shots, merged subtype folders empty, no orphan files. | `verify_splits_present()`, `verify_no_excluded()`, `verify_no_removed_shots()`, `verify_class_merge()`, `verify_shuttle_sync()`, `print_dataset_summary()`. |
-| `shuttle_extractor.py` | Runs TrackNetV3 on each clip to detect shuttle positions, then converts CSVs to normalized `(t, 3)` numpy arrays `[x_norm, y_norm, visibility]`. The CSV->npy conversion regenerates every npy unconditionally (no skip-existing), so a re-extract pops a fresh npy rather than leaving a stale one. Uses **batch mode** (`batch_predict.py`) to load models once per worker and iterate over clips in-process, avoiding the ~8s model-reload per clip. Uses the default `eval_mode='weight'` (full temporal ensemble) for maximum detection accuracy. `--batch_size` (default 32, configurable via CLI) controls GPU utilization. Inference runs in **FP32** to preserve detection accuracy on fast-moving shuttles (FP16 rounding can flip the 0.5 heatmap threshold on faint responses). Frames are pre-resized during loading using PIL BICUBIC (bit-identical to the Dataset's own resize). VideoCapture handles are explicitly released and `gc.collect()` + `torch.cuda.empty_cache()` run between clips to prevent resource exhaustion. `--workers N` launches N parallel batch workers, each with its own model copy (use 1 on V100 16GB, 2+ on larger GPUs). On V100 16GB, batch_size 16 fits most clips; a few may OOM, so re-run with batch_size 8 to pick up stragglers (resume logic skips clips that already have CSVs). `--dry-run` processes clips without writing output files (for testing). TrackNetV3 shares the BST training venv. **Pretrained weights** (`ckpts/TrackNet_best.pt`, `ckpts/InpaintNet_best.pt`) must be downloaded separately (~150 MB, gitignored) — see `TrackNetV3/README.md`. | `extract_all_shuttles(tracknet_dir, tracknet_python, max_workers, batch_size, dry_run)`, `shuttle_csvs_to_npy()`. Intermediate output: `data/shuttleset/shuttle_csv/` (flat dir of per-clip CSVs, taxonomy/split independent). Final output: `data/shuttleset/shuttle_npy/{clip}.npy` (flat; split + label come from `notebooks/clips_master.csv` at collation time). |
-| `court_utils.py` | Optional. Homography-based camera-to-court coordinate projection. Not required for the core pipeline. | `project_to_court()`, `normalize_court_position()`. |
+| `shuttle_extractor.py` | Runs TrackNetV3 on each clip to detect shuttle positions, then converts CSVs to normalized `(t, 3)` numpy arrays `[x_norm, y_norm, visibility]`. The CSV->npy conversion regenerates every npy unconditionally (no skip-existing), so a re-extract pops a fresh npy rather than leaving a stale one. Uses **batch mode** (`batch_predict.py`) to load models once per worker and iterate over clips in-process, avoiding the ~8s model-reload per clip. Uses the default `eval_mode='weight'` (full temporal ensemble) for maximum detection accuracy. `--batch_size` (default 32, configurable via CLI) controls GPU utilization. Inference runs in **FP32** to preserve detection accuracy on fast-moving shuttles (FP16 rounding can flip the 0.5 heatmap threshold on faint responses). Frames are pre-resized during loading using PIL BICUBIC (bit-identical to the Dataset's own resize). VideoCapture handles are explicitly released and `gc.collect()` + `torch.cuda.empty_cache()` run between clips to prevent resource exhaustion. `--workers N` launches N parallel batch workers, each with its own model copy (use 1 on V100 16GB, 2+ on larger GPUs). On V100 16GB, batch_size 16 fits most clips; a few may OOM, so re-run with batch_size 8 to pick up stragglers (resume logic skips clips that already have CSVs). `--dry-run` processes clips without writing output files (for testing). TrackNetV3 shares the BST training venv. **Pretrained weights** (`ckpts/TrackNet_best.pt`, `ckpts/InpaintNet_best.pt`) must be downloaded separately (~150 MB, gitignored) — see `src/shared/tracknetv3/README.md`. | `extract_all_shuttles(tracknet_dir, tracknet_python, max_workers, batch_size, dry_run)`, `shuttle_csvs_to_npy()`. Intermediate output: `data/shuttleset/shuttle_csv/` (flat dir of per-clip CSVs, taxonomy/split independent). Final output: `data/shuttleset/shuttle_npy/{clip}.npy` (flat; split + label come from `notebooks/clips_master.csv` at collation time). |
+| `shared/court.py` | Homography-based camera-to-court projection shared with BRIC and the annotator. | `build_all_court_info()`, `to_court_coordinate()`, `normalize_position()`. |
 
 #### Pipeline output structure
 
@@ -142,15 +143,15 @@ data/shuttleset/
     {vid}_{set}_{rally}_{ball_round}.npy
 ```
 
-Split and label assignment for `shuttle_npy/` (and downstream pose npys) come from `notebooks/clips_master.csv` at collation time, not from directory structure. The clips directory stays nested for now. See `docs/architecture_notes/completed_general_refactors/dir_flatten_refactor.md` for the migration.
+Split and label assignment for `shuttle_npy/` (and downstream pose npys) come from `notebooks/clips_master.csv` at collation time, not from directory structure. The clips directory stays nested for now. See `docs/archive/completed_general_refactors/dir_flatten_refactor.md` for the migration.
 
 #### Key concepts
 
 - **Class merging**: Each taxonomy pins its full ordered class list and a merge map that folds rare raw subtypes into parents. The current Architecture 1 active config is `une_v1_14` (4 subtypes folded -> 14 merged types, no sides, unknown excluded); `une_v1_15` is the same plus `unknown` (15). The BST-paper family folds 6 subtypes to 12 base types: `bst_25` (12 x Top/Bottom + `unknown` = 25), `bst_24` (no unknown = 24), `bst_12` (nosides = 12). `shuttleset_18` keeps the 18 raw types (no merge, no sides, no unknown). Whether `unknown` is kept is contractual per taxonomy (its `excluded_base_stroke_types`), not a runtime flag.
 - **Flaw records**: `flaw_shot_records.csv` is the single source of truth for data exclusions. Whole-video exclusions and individual shot removals are parsed at import time.
 - **Clip windows**: Control how much temporal context surrounds each stroke. `between_2_hits_with_max_limits` (default) uses the interval between adjacent shots, clamped to 1.5s per side.
-- **Homography resolution**: The pre-computed homography matrices in `data/shuttleset/set/homography.csv` were calculated at 1280x720 (W x H). `court_utils.scale_pos_by_resolution()` rescales coordinates from the video's native resolution to 1280x720 before applying the homography. This quantization is negligible for court-position features (~1cm precision on a 13m court), but worth keeping in mind if homography-derived coordinates are ever combined with features extracted at native resolution (e.g., shuttle trajectory positions relative to a video crop). In practice any mismatch would be sub-pixel at typical crop sizes and likely acts as minor augmentation noise.
-- **Video resolution**: The pipeline downloads the best available mp4 (video-only, no audio). Downstream models resize frames internally (TrackNetV3 to 512x288 (W x H) per `TrackNetV3/utils/general.py`; the pose stack to 640x640 (W x H) for detection and 192x256 (W x H) per pose crop, named 256x192 upstream in HxW order), so resolutions above 720p provide no practical benefit while increasing file size and processing time.
+- **Homography resolution**: The pre-computed homography matrices in `data/shuttleset/set/homography.csv` were calculated at 1280x720 (W x H). `shared.court.scale_pos_by_resolution()` rescales native video coordinates before applying a homography.
+- **Video resolution**: The pipeline downloads the best available mp4 (video-only, no audio). Downstream models resize frames internally (TrackNetV3 to 512x288 (W x H) per `src/shared/tracknetv3/utils/general.py`; the pose stack to 640x640 (W x H) for detection and 192x256 (W x H) per pose crop, named 256x192 upstream in HxW order), so resolutions above 720p provide no practical benefit while increasing file size and processing time.
 
 ---
 
@@ -162,7 +163,7 @@ The pipeline produces **video clips** and **shuttle .npy files**. BST-X does not
 
 | Module | Role | Key functions / concepts |
 |--------|------|--------------------------|
-| `prepare_train_on_shuttleset.py` | Runs the rtmlib pose stack on each clip to extract 2D player keypoints, combines them with shuttle trajectories at collation time, normalizes everything, and collates per-sample arrays into batch-ready `.npy` files. | Shuttle extraction and the CSV->npy conversion are owned upstream by `build_dataset` (step 6, `pipeline/shuttle_extractor.py`); this stage assumes the shuttle npys already exist under `data/shuttleset/shuttle_npy/`. **Step 1**: `prepare_dataset_npy_from_raw_video()` -- run pose estimation (rtmlib RTMDet-M + RTMPose-L), extract court positions via homography, normalize joints by bounding box, save per-clip `_joints.npy`, `_pos.npy`, `_failed.npy`. Shuttle data is intentionally not read here -- keeping this step independent of shuttle-npy availability prevents a missing npy from silently blocking the expensive GPU job. **Step 2**: `collate_npy(taxonomy=..., shuttle_npy_dir=...)` -- reads shuttle npys from the canonical `data/shuttleset/shuttle_npy/` dir (dedup + resolution-normalisation already done once at the converter), applies temporal alignment and failed-frame masking, pads all samples to uniform `seq_len`, computes bone vectors and interpolated joints, stacks into single arrays per split. The `taxonomy` parameter (a `Taxonomy` instance from `pipeline.config`) determines the class list for label assignment. RTMPose crops are resized internally (192x256, W x H), so video resolution does not affect pose estimation quality beyond ~720p. |
+| `prepare_train_on_shuttleset.py` | Runs the rtmlib pose stack on each clip to extract 2D player keypoints, combines them with shuttle trajectories at collation time, normalizes everything, and collates per-sample arrays into batch-ready `.npy` files. | Shuttle extraction and the CSV->npy conversion are owned upstream by `build_dataset` (step 6, `pipeline/shuttle_extractor.py`); this stage assumes the shuttle npys already exist under `data/shuttleset/shuttle_npy/`. **Step 1**: `prepare_dataset_npy_from_raw_video()` -- run pose estimation (rtmlib RTMDet-M + RTMPose-L), extract court positions via homography, normalize joints by bounding box, save per-clip `_joints.npy`, `_pos.npy`, `_failed.npy`. Shuttle data is intentionally not read here -- keeping this step independent of shuttle-npy availability prevents a missing npy from silently blocking the expensive GPU job. **Step 2**: `collate_npy(taxonomy=..., shuttle_npy_dir=...)` -- reads shuttle npys from the canonical `data/shuttleset/shuttle_npy/` dir (dedup + resolution-normalisation already done once at the converter), applies temporal alignment and failed-frame masking, pads all samples to uniform `seq_len`, computes bone vectors and interpolated joints, stacks into single arrays per split. The `taxonomy` parameter (a `Taxonomy` instance from `classifier_shared.taxonomy`) determines the class list for label assignment. RTMPose crops are resized internally (192x256, W x H), so video resolution does not affect pose estimation quality beyond ~720p. |
 
 #### Setup
 
@@ -177,14 +178,14 @@ ln -s /scratch/comp320a/ShuttleSet_data_une_v1_14 ShuttleSet_data_une_v1_14
 
 If running locally or without scratch, no setup is needed -- the script creates `ShuttleSet_data_{taxonomy}/` and all subdirectories automatically.
 
-**Taxonomy independence of pose data:** Pose data is physically taxonomy-independent. Clip filenames (`{vid}_{set}_{rally}_{ball}`) are physical identifiers -- the same clip produces byte-identical keypoints regardless of which taxonomy folder it sits in. In principle, pose results from one taxonomy can be reused by another via filename matching (the folder structure differs but the data is identical). A future refactor could flatten pose output entirely and defer taxonomy-aware organization to collation.
+**Taxonomy independence of pose data:** Phase-2 pose data is already flat and taxonomy-independent. `BST_X_RTMPOSE_NPY_DIR` points to `ShuttleSet_keypoints_clean_sticky_anchor/`, where each clip stem identifies one set of pose arrays. The collator applies the selected taxonomy and writes the result under `ShuttleSet_data_<taxonomy>/`.
 
 #### CLI usage
 
 Run from the repo root with both package roots on PYTHONPATH:
 
 ```bash
-export PYTHONPATH=src/bst_x
+export PYTHONPATH=src:src/bst_x
 
 # Preview what would be done:
 python -m preparing_data.prepare_train_on_shuttleset --dry-run
@@ -264,20 +265,24 @@ Before training, run the validation scripts to assess detection quality. Two ind
 
 #### Usage
 
-Run from `src/bst_x/` (rtmlib or BST venv -- only needs numpy, matplotlib, pandas):
+Run from the repository root (rtmlib or BST venv -- only needs numpy, matplotlib, pandas):
 
 ```bash
-# Minimal (pose failure stats only):
-python validation_scripts/validate_zeroed_frames.py \
-    --data-root /scratch/comp320a/ShuttleSet_data_une_v1_14 \
+# Minimal (current Phase-2 pose failure stats only):
+python src/bst_x/validation_scripts/validate_zeroed_frames.py \
+    --data-root /scratch/comp320a/ShuttleSet_keypoints_clean_sticky_anchor \
+    --dataset-npy-dir /scratch/comp320a/ShuttleSet_keypoints_clean_sticky_anchor \
+    --split-column split_v2 \
     --taxonomy une_v1_14
 
 # Full (adds flaw cross-reference, hit-frame proximity, shuttle analysis):
-python validation_scripts/validate_zeroed_frames.py \
-    --data-root /scratch/comp320a/ShuttleSet_data_une_v1_14 \
+python src/bst_x/validation_scripts/validate_zeroed_frames.py \
+    --data-root /scratch/comp320a/ShuttleSet_keypoints_clean_sticky_anchor \
+    --dataset-npy-dir /scratch/comp320a/ShuttleSet_keypoints_clean_sticky_anchor \
+    --split-column split_v2 \
     --taxonomy une_v1_14 \
     --set-dir data/shuttleset/set \
-    --shuttle-npy-dir data/shuttleset/shuttle_npy
+    --shuttle-npy-dir /scratch/comp320a/ShuttleSet/shuttle_npy_flat
 ```
 
 Optional flags: `--threshold` (flagged-clip cutoff, default 0.5), `--hit-window` (frames either side of hit, default 10), `--taxonomy` (for label derivation and output filenames, default `une_v1_14`).
@@ -295,7 +300,7 @@ See `validation_scripts/README.md` for full argument and report section document
 
 ### Stage 3 -- Dataset Loading (`preparing_data/shuttleset_dataset.py`)
 
-Bridges collated `.npy` files to PyTorch `DataLoader`s. Imports `Taxonomy` from `pipeline.config` for class list construction.
+Bridges collated `.npy` files to PyTorch `DataLoader`s. Uses `Taxonomy` from `classifier_shared.taxonomy` for class list construction.
 
 #### Key classes and functions
 
@@ -336,7 +341,8 @@ import pandas as pd
 from torch.utils.data import Dataset
 
 from pipeline.clip_index import build_clip_path_index
-from pipeline.config import CLIPS_OUTPUT_DIR, TAXONOMIES
+from classifier_shared.taxonomy import TAXONOMIES
+from pipeline.config import CLIPS_OUTPUT_DIR
 
 
 class ClipVideoDataset(Dataset):
@@ -402,7 +408,7 @@ One graph now: PPF, CG and AP always run. `BST_CG_AP` stays as a plain alias of 
 BST_CG_AP = BST  # PPF/CG/AP always on; the one graph the project trains
 ```
 
-The old `use_ppf` / `use_cg` / `use_ap` flags and the `BST_0` / `BST_PPF` / `BST_CG` / `BST_AP` partials came out when CG and AP went always-on; their wiring lives in `docs/architecture_notes/completed_general_refactors/structure_and_guards_pass/bst_variant_flags_design.md`.
+The old `use_ppf` / `use_cg` / `use_ap` flags and the `BST_0` / `BST_PPF` / `BST_CG` / `BST_AP` partials came out when CG and AP went always-on; their wiring lives in `docs/archive/completed_general_refactors/structure_and_guards_pass/bst_variant_flags_design.md`.
 
 #### Key hyperparameters (defaults from `bst_x_train.py`)
 
@@ -509,13 +515,15 @@ Lightweight script for loading a trained checkpoint and predicting stroke types.
 ### Full dependency chain (BST-X on ShuttleSet)
 
 ```
-pipeline/config.py                     # Taxonomy, stroke types, splits, paths, merge map
+classifier_shared/taxonomy.py          # Taxonomy, stroke types, class labels, merge map
+pipeline/config.py                     # Paths, splits, pipeline settings
     |
     v
 pipeline/build_dataset.py             # Orchestrates Steps 1-6 (--taxonomy flag)
-  -> download_videos.py               # Step 1: yt-dlp download
+  -> download_adapter.py              # Step 1: ShuttleSet adapter to shared yt-dlp downloader
+  -> video_metadata.py                # Step 2: resolution CSV
   -> clip_generator.py                # Steps 3-4: clip extraction + class merge
-     -> player_mapping.py             # A/B -> Top/Bottom
+     -> classifier_shared/player_mapping.py  # A/B -> Top/Bottom
   -> verify.py                        # Step 5: sanity checks
   -> shuttle_extractor.py             # Step 6: TrackNetV3 shuttle detection
     |
@@ -532,7 +540,7 @@ validation_scripts/validate_zeroed_frames.py  # Data quality check (optional, pr
     |
     v
 preparing_data/shuttleset_dataset.py  # PyTorch Dataset + DataLoader wrappers
-  -> pipeline.config                  # Imports Taxonomy, TAXONOMIES
+  -> classifier_shared.taxonomy       # Imports Taxonomy, TAXONOMIES
     |
     v
 model/tempose.py                      # TCN, MLP, TransformerEncoder, etc.
@@ -554,7 +562,8 @@ result_utils.py                       # F1 scores, confusion matrices
 ### What stays the same
 
 - **The entire `pipeline/` directory.** The pipeline produces labeled video clips and shuttle trajectories. It is model-agnostic -- it doesn't know or care what architecture consumes its output.
-- **`pipeline/config.py`** remains the single source of truth for stroke types, class labels, splits, and merge rules. Your custom dataset loader should import from here to stay in sync.
+- **`classifier_shared/taxonomy.py`** is the single source of truth for stroke types, class labels, and merge rules. Your custom dataset loader should import taxonomy definitions from here to stay in sync.
+- **`pipeline/config.py`** provides dataset paths, splits, and pipeline settings.
 - **`result_utils.py`** works with any model that produces `(predictions, ground_truth)` tensors. `show_f1_results()` and `plot_confusion_matrix()` are architecture-agnostic.
 
 ### What changes or may be replaced
@@ -565,7 +574,7 @@ This is the most likely point of divergence.
 
 - **If your model operates on raw video** (e.g. a video transformer, 3D CNN, or SlowFast): you can skip pose estimation entirely. Load clips directly from `data/shuttleset/clips/` using a standard video DataLoader. The folder structure already encodes labels via directory names (`{Player}_{stroke_type}`).
 
-- **If your model uses different input features**: you may need different preprocessing. For example, optical flow, different skeleton formats (not COCO-17), or different normalization schemes. Write your own preparation script, but reuse `pipeline.config` for label definitions.
+- **If your model uses different input features**: you may need different preprocessing. For example, optical flow, different skeleton formats (not COCO-17), or different normalization schemes. Write your own preparation script, but reuse `classifier_shared.taxonomy` for label definitions.
 
 - **If your model uses pose but at different granularity**: the existing `collate_npy()` supports 4 pose styles (J_only, JnB_interp, JnB_bone, Jn2B). If these suffice, you can reuse the collated arrays directly. If not (e.g., you need raw unnormalized keypoints, or a different skeleton topology), modify the preparation step.
 
@@ -578,7 +587,7 @@ BST-X's dataset classes return a specific tuple format: `(human_pose, pos, shutt
   - Does your model handle variable-length sequences internally (e.g. via packed sequences or attention masks), or does it need pre-padded fixed-length input? BST-X uses fixed-length padding + a `video_len` mask.
   - Does your model operate on pre-collated batched arrays, or per-clip files? `Dataset_npy_collated` loads pre-collated arrays into RAM at init; if a future model needs lazy per-clip loading, write a new Dataset (the legacy `Dataset_npy` lazy loader was excised pre-phase-2; the verbatim source is in `docs/architecture_notes/historical_bst.md` section 4.1).
 
-- **Label list construction**: All class labels are now English. Read `taxonomy.classes` (the authoritative ordered tuple) from any `Taxonomy` in `pipeline.config.TAXONOMIES`, or call `taxonomy_lookup(name)` for the same lookup by canonical name. Labels.npy lands in `[0, taxonomy.n_classes)` directly (no runtime active/full remap). Available taxonomies: `'bst_25'`, `'bst_24'`, `'bst_12'`, `'une_v1_14'` (Architecture 1 active), `'une_v1_15'`, `'shuttleset_18'`. To add a custom taxonomy, define it in `pipeline/config.py` (see the `Taxonomy` dataclass and existing instances for the pattern).
+- **Label list construction**: All class labels are English. Read `taxonomy.classes` from any `Taxonomy` in `classifier_shared.taxonomy.TAXONOMIES`, or call `taxonomy_lookup(name)`. Labels.npy lands in `[0, taxonomy.n_classes)` directly. BST-X taxonomies are `'bst_25'`, `'bst_24'`, `'bst_12'`, `'une_v1_14'` (Architecture 1 active), `'une_v1_15'`, and `'shuttleset_18'`. Define new classifier taxonomies in `classifier_shared/taxonomy.py`.
 
 #### 3. Model architecture (`model/`)
 

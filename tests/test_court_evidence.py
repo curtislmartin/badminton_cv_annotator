@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 import annotator.court_evidence as evidence
+import annotator.point_winner as point_winner
 from annotator.calibration.fixtures import FIXTURES
 from annotator.config import COMPOSITION_CONTENT_THRESHOLD
 from annotator.point_winner import corner_error_band_from_corners, project_pixels_to_court
@@ -47,6 +48,50 @@ def _pose_inputs(n_frames: int, n_slots: int = 3) -> tuple[np.ndarray, np.ndarra
     return bboxes, scores, ndet
 
 
+def test_static_corner_order_matches_pose_columns_and_landing_band(monkeypatch) -> None:
+    camera_order = np.array([
+        [11.0, 12.0],  # top-left
+        [21.0, 22.0],  # top-right
+        [41.0, 42.0],  # bottom-left
+        [31.0, 32.0],  # bottom-right
+    ])
+    courtkeynet_order = np.array([
+        [11.0, 12.0],
+        [21.0, 22.0],
+        [31.0, 32.0],
+        [41.0, 42.0],
+    ])
+    monkeypatch.setattr(evidence, 'get_corner_camera', lambda _row: camera_order.T)
+    static_corners = evidence._static_corners_refpx(pd.Series(dtype=float))
+    np.testing.assert_array_equal(static_corners, courtkeynet_order)
+
+    rows = evidence.build_scene_rows(
+        7, [(2, 6)], [static_corners], (1280.0, 720.0),
+    )
+    pose_columns = rows.loc[0, [
+        'upleft_x', 'upleft_y', 'upright_x', 'upright_y',
+        'downleft_x', 'downleft_y', 'downright_x', 'downright_y',
+    ]].to_numpy(dtype=float)
+    np.testing.assert_array_equal(
+        pose_columns,
+        courtkeynet_order[[0, 1, 3, 2]].reshape(-1),
+    )
+
+    received = []
+
+    def fake_error_band(corners, _court_info, _err_px):
+        received.append(corners.copy())
+        return 1.25
+
+    monkeypatch.setattr(point_winner, 'get_corner_camera', lambda _row: camera_order.T)
+    monkeypatch.setattr(point_winner, 'corner_error_band_from_corners', fake_error_band)
+    result = point_winner.corner_error_band_m(
+        7, pd.DataFrame(index=[7]), _identity_info(), 3.5,
+    )
+    assert result == 1.25
+    np.testing.assert_array_equal(received[0], courtkeynet_order)
+
+
 @pytest.mark.parametrize(('fps', 'minimum'), [(25.0, 13), (30.0, 15)])
 def test_raw_cut_wrapper_uses_exact_arguments_and_partitions(monkeypatch, fps, minimum) -> None:
     calls = []
@@ -75,6 +120,11 @@ def test_raw_cut_wrapper_uses_exact_arguments_and_partitions(monkeypatch, fps, m
 )
 def test_centred_bin_samples(start, end, expected) -> None:
     assert evidence.scene_sample_indices(start, end) == expected
+
+
+def test_scene_sample_limit_is_the_executable_cap() -> None:
+    samples = evidence.scene_sample_indices(0, evidence.COURT_SCENE_SAMPLE_LIMIT + 5)
+    assert len(samples) == evidence.COURT_SCENE_SAMPLE_LIMIT
 
 
 def test_detect_scene_evidence_decodes_once_in_scene_order(monkeypatch) -> None:
@@ -174,7 +224,8 @@ def test_keep_vote_ignores_outside_people_and_includes_margin_boundaries() -> No
     bboxes = np.zeros((1, 4, 4), dtype=float)
     scores = np.full((1, 4), 0.9, dtype=float)
     ndet = np.array([4], dtype=int)
-    centres = [(-0.1, 0.5), (1.1, 1.1), (0.5, 0.5), (-0.2, 0.5)]
+    margin = evidence.PERSON_COURT_MARGIN
+    centres = [(-margin, 0.5), (1.0 + margin, 1.0 + margin), (0.5, 0.5), (-margin - 0.1, 0.5)]
     for slot, (x, y) in enumerate(centres):
         pixel_x, pixel_y = x * 1280.0, y * 720.0
         bboxes[0, slot] = (pixel_x - 1.0, pixel_y - 2.0, pixel_x + 1.0, pixel_y)
@@ -207,7 +258,7 @@ def test_parent_evidence_applies_inclusive_scene_majority() -> None:
         ndet,
     )
     first_record, second_record = result.scene_records
-    assert first_record.exactly_two_fraction == pytest.approx(0.5)
+    assert first_record.exactly_two_fraction == pytest.approx(evidence.SCENE_VALID_MIN_FRACTION)
     assert first_record.scene_valid is True
     assert second_record.exactly_two_fraction == pytest.approx(1 / 3)
     assert second_record.scene_valid is False
@@ -219,8 +270,8 @@ def test_detected_inputs_use_only_accepted_scene_quads() -> None:
     quad = _quad(np.array([[0, 0], [512, 0], [512, 288], [0, 288]]))
     bboxes, scores, ndet = _pose_inputs(20)
     ndet[10:] = 0
-    inputs = evidence.build_detected_court_inputs(
-        1,
+    result = evidence.build_detected_court_evidence(
+        '', '', 1,
         (1280.0, 720.0),
         cuts,
         [evidence.SceneEvidence(0, 10, (2,), quad), evidence.SceneEvidence(10, 20, (12,), None)],
@@ -228,6 +279,8 @@ def test_detected_inputs_use_only_accepted_scene_quads() -> None:
         scores,
         ndet,
     )
+    inputs = result.inputs
+    assert inputs is not None
 
     assert inputs.homography_rows[['start_frame', 'end_frame']].values.tolist() == [[0, 10]]
     projected = project_pixels_to_court(

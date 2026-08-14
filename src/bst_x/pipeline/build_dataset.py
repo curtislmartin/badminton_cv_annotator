@@ -11,9 +11,9 @@ Runs all pipeline steps in sequence:
 All paths default to pipeline.config values.
 
 Usage:
-    python -m pipeline.build_dataset --tracknet-dir /path/to/TrackNetV3
+    python -m pipeline.build_dataset
     python -m pipeline.build_dataset --skip-download --skip-resolution --skip-shuttle
-    python -m pipeline.build_dataset --skip-clips --skip-verify --tracknet-dir TrackNetV3
+    python -m pipeline.build_dataset --skip-clips --skip-verify
     python -m pipeline.build_dataset --dry-run
 """
 import argparse
@@ -23,17 +23,27 @@ from pathlib import Path
 from pipeline.config import (
     RAW_VIDEO_DIR, CLIPS_OUTPUT_DIR, RESOLUTION_CSV_PATH,
     SPLITS, EXCLUDED_VIDEOS, REMOVED_SHOTS, CLIP_WINDOW,
-    TAXONOMIES, Taxonomy, taxonomy_lookup,
+)
+from classifier_shared.taxonomy import (
+    BST_X_TAXONOMIES,
+    TAXONOMIES,
+    Taxonomy,
+    taxonomy_lookup,
 )
 
-from pipeline.download_videos import download_all_videos, build_resolution_csv
+from pipeline.download_adapter import download_shuttleset_videos
+from pipeline.video_metadata import build_resolution_csv, find_video_files
 from pipeline.clip_generator import generate_all_clips, apply_class_merge
 from pipeline.verify import (
     _scan_clips, verify_splits_present, verify_no_excluded,
     verify_no_removed_shots, verify_class_merge as verify_merge,
     verify_shuttle_sync, warn_orphan_files, print_dataset_summary,
 )
-from pipeline.shuttle_extractor import extract_all_shuttles, shuttle_csvs_to_npy
+from pipeline.shuttle_extractor import (
+    DEFAULT_TRACKNET_DIR,
+    extract_all_shuttles,
+    shuttle_csvs_to_npy,
+)
 
 # Default taxonomy for pipeline operations when not explicitly overridden.
 # Matches the project's working baseline; pick a different one via the CLI
@@ -61,11 +71,10 @@ def _validate_inputs(
     :raises FileNotFoundError: If tracknet_dir doesn't exist or is missing
         batch_predict.py, or if raw videos are missing when download is skipped.
     """
-    # Shuttle extraction requires --tracknet-dir
     if not skip_shuttle:
         if not tracknet_dir:
             raise ValueError(
-                '--tracknet-dir is required unless --skip-shuttle is provided.'
+                'tracknet_dir is required unless shuttle extraction is skipped.'
             )
         if not tracknet_dir.is_dir():
             raise FileNotFoundError(
@@ -182,14 +191,14 @@ def run_pipeline(
 
     if not skip_download:
         _step(1, 'Downloading videos from YouTube')
-        download_all_videos(max_workers=workers)
+        download_shuttleset_videos(max_workers=workers)
     else:
         print('Step 1: Skipped (--skip-download)')
 
     # Check videos exist first.
     if not skip_resolution:
         _step(2, 'Building resolution CSV')
-        video_files = list(RAW_VIDEO_DIR.glob('*.*'))
+        video_files = find_video_files(RAW_VIDEO_DIR)
         if not video_files:
             print(f'ERROR: No video files found in {RAW_VIDEO_DIR}')
             print('Step 1 may have failed silently. Aborting.')
@@ -263,8 +272,8 @@ def run_pipeline(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--tracknet-dir', type=Path, default=None,
-                        help='Path to cloned TrackNetV3 repository')
+    parser.add_argument('--tracknet-dir', type=Path, default=DEFAULT_TRACKNET_DIR,
+                        help='TrackNetV3 directory (default: src/shared/tracknetv3)')
     parser.add_argument('--workers', type=int, default=2,
                         help='Parallel workers for downloads and TrackNetV3')
     parser.add_argument('--batch-size', type=int, default=32,
@@ -281,7 +290,8 @@ if __name__ == '__main__':
                         help='Skip TrackNetV3 shuttle trajectory extraction')
     parser.add_argument('--no-merge', action='store_true',
                         help='Skip class merging (keep all 19 stroke types)')
-    parser.add_argument('--taxonomy', default=_DEFAULT_TAXONOMY_NAME, choices=list(TAXONOMIES.keys()),
+    parser.add_argument('--taxonomy', default=_DEFAULT_TAXONOMY_NAME,
+                        choices=list(BST_X_TAXONOMIES),
                         help=f'Stroke type taxonomy (default: {_DEFAULT_TAXONOMY_NAME})')
     parser.add_argument('--dry-run', action='store_true',
                         help='Preview what the pipeline would do without executing')

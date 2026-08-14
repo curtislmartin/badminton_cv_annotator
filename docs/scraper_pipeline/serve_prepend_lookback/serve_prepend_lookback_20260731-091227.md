@@ -1,5 +1,10 @@
 # Serve-prepend lookback: current build orientation
 
+> Update 2026-08-08: the three-video candidate follow-up is complete. Its
+> [measurement and decision](serve_prepend_lookback_20260808_measurement.md)
+> supersede this document for Issue 28. Keep this file for the earlier baseline
+> and processing-order orientation.
+
 Validated 2026-07-31 against commit `63f40938a62f6612ca9a63b61127d24442a80865`.
 This is the authoritative current-code orientation for the deferred feature. It records an
 exploratory measurement and the smallest next build. It does not implement serve prepend.
@@ -339,8 +344,7 @@ The links below are relative to this document.
   point-winner calls
 - [rally_segmentation.py](../../../src/annotator/rally_segmentation.py):
   `segment_video`, `assemble_contacts`, `detect_contact_flags`,
-  `detect_contacts`, `ServeStartOptions`,
-  `_sticky_serve_setup_before` and `apply_replay_mask`
+  `ServeStartOptions`, `_sticky_serve_setup_before` and `apply_replay_mask`
 - [types.py](../../../src/annotator/types.py): `ServeStartConfig`,
   `ContactCandidate`, `StickyResult` and `true_runs`
 - [replay_mask.py](../../../src/annotator/replay_mask.py):
@@ -354,7 +358,7 @@ The links below are relative to this document.
 - [gt_scoring.py](../../../src/annotator/calibration/gt_scoring.py):
   `canonical_tolerance`, `build_run_video_inputs`,
   `score_video` and the existing `--no-replay-mask` precedent
-- [stage11_pairing.py](../../../src/scraper/stage11_pairing.py):
+- [commentary_pairing.py](../../../src/scraper/commentary_pairing.py):
   `_believed_replay_in_rally_interior` and the span-end pairing window
 
 ## 9. Lean definition of done

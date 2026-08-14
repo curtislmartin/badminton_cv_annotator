@@ -32,7 +32,7 @@ labelled sections say so.
 The handover was moved here on 2026-07-31 because replay-event labelling is
 the first dependency in its replay family. The current replay-labelling
 assessment is at
-[`non_play_manual_labelling_20260731-095201.md`](../scraper_pipeline/broadcast_nonstandard_camera_id/non_play_manual_labelling_20260731-095201.md);
+[`broadcast_timeline_labelling_20260731-095201.md`](../scraper_pipeline/broadcast_nonstandard_camera_id/broadcast_timeline_labelling_20260731-095201.md);
 that note supersedes stale claims about current measurements, but preserves
 this handover as historical design context.
 
@@ -284,7 +284,7 @@ audit stronger.
 Every 2026-07-23 count in §1 was measured against the pre-W2.9 sticky
 build. W2.9 changed contact behaviour on all three fixtures (contact_f1
 lifted; server/getpoint moved in mixed directions; see
-`docs/architecture_notes/completed_general_refactors/annotator_cleanup/w2_9_delta.diff`).
+`docs/archive/completed_general_refactors/annotator_cleanup/w2_9_delta.diff`).
 The miss ledger and the 113 / 23 track split must be re-measured on the
 current chain before either lookback design or replay-mask redesign
 proceeds.

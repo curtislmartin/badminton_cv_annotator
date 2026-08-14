@@ -1,16 +1,16 @@
 """Court evidence and parent-specific geometry for the annotator chain.
 
-The adapter keeps the static ShuttleSet prior and the CourtKeyNet parent on the
-same operational interface.  The two parents share only their raw scene
-intervals; scene geometry and person votes are built from the active parent.
+Here, a parent is one alternative court-evidence producer profile for a run,
+not process lineage. The adapter keeps the static ShuttleSet homography and
+detected CourtKeyNet consensus parents on the same operational interface. The
+two parents share only their raw scene intervals; scene geometry and person
+votes are built from the active parent.
 """
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ from .config import COMPOSITION_CONTENT_THRESHOLD
 from .fps_constants import scale_for_fps
 from .point_winner import (
     COURT_LENGTH_M,
+    SHUTTLESET_TO_COURTKEYNET_CORNER_ORDER,
     corner_error_band_from_corners,
     project_pixels_to_court,
 )
@@ -33,7 +34,16 @@ SCENE_ROW_COLUMNS = (
     'upleft_x', 'upleft_y', 'upright_x', 'upright_y',
     'downleft_x', 'downleft_y', 'downright_x', 'downright_y',
 )
+POSE_SCENE_COLUMNS_BY_COURTKEYNET_CORNER = (
+    ('upleft', 0),
+    ('upright', 1),
+    ('downleft', 3),
+    ('downright', 2),
+)
 DETECTOR_RESOLUTION = (512.0, 288.0)
+COURT_SCENE_SAMPLE_LIMIT = 10
+PERSON_COURT_MARGIN = 0.10
+SCENE_VALID_MIN_FRACTION = 0.5
 UNIT_COURT_CORNERS = np.array(
     [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
     dtype=np.float32,
@@ -84,7 +94,10 @@ class SceneEvidence:
 
 @dataclass(frozen=True)
 class CourtSceneRecord:
-    """Typed evidence for one raw scene, ready for the court-scenes writer."""
+    """Typed evidence for one raw scene, ready for the court-scenes writer.
+
+    :param parent: court-evidence producer profile used for this scene.
+    """
 
     video_id: int | str
     case_id: str
@@ -193,7 +206,7 @@ def scene_sample_indices(start_frame: int, end_frame: int) -> list[int]:
     scene_length = end_frame - start_frame
     if scene_length <= 0:
         raise ValueError('scene interval must be non-empty')
-    sample_count = min(10, scene_length)
+    sample_count = min(COURT_SCENE_SAMPLE_LIMIT, scene_length)
     return [
         start_frame + ((2 * sample_index + 1) * scene_length // (2 * sample_count))
         for sample_index in range(sample_count)
@@ -253,7 +266,7 @@ def _as_native_corners(corners_refpx: np.ndarray) -> np.ndarray:
 def _static_corners_refpx(homography_row: pd.Series) -> np.ndarray:
     """Return static row corners in the CourtKeyNet TL/TR/BR/BL order."""
     source_order = get_corner_camera(homography_row).T
-    return source_order[[0, 1, 3, 2]].copy()
+    return source_order[list(SHUTTLESET_TO_COURTKEYNET_CORNER_ORDER)].copy()
 
 
 def detected_court_info(corners_refpx: np.ndarray) -> dict[str, object]:
@@ -338,12 +351,11 @@ def _scene_row(
         ]
     )
     row: dict[str, object] = {
-        'video_id': int(video_id) if str(video_id).lstrip('-').isdigit() else str(video_id),
+        'video_id': video_id,
         'start_frame': interval[0],
         'end_frame': interval[1],
     }
-    prefixes = {'upleft': 0, 'upright': 1, 'downleft': 3, 'downright': 2}
-    for prefix, corner_index in prefixes.items():
+    for prefix, corner_index in POSE_SCENE_COLUMNS_BY_COURTKEYNET_CORNER:
         row[f'{prefix}_x'] = float(pose_corners[corner_index, 0])
         row[f'{prefix}_y'] = float(pose_corners[corner_index, 1])
     return row
@@ -389,10 +401,10 @@ def build_keep_vote(
             inside = (
                 finite_scores
                 & finite_boxes
-                & (normalised[:, 0] >= -0.10)
-                & (normalised[:, 0] <= 1.10)
-                & (normalised[:, 1] >= -0.10)
-                & (normalised[:, 1] <= 1.10)
+                & (normalised[:, 0] >= -PERSON_COURT_MARGIN)
+                & (normalised[:, 0] <= 1.0 + PERSON_COURT_MARGIN)
+                & (normalised[:, 1] >= -PERSON_COURT_MARGIN)
+                & (normalised[:, 1] <= 1.0 + PERSON_COURT_MARGIN)
             )
             keep_vote[frame] = int(inside.sum()) == 2
     return keep_vote
@@ -544,7 +556,10 @@ def build_static_court_evidence(
     keep_vote = build_keep_vote(
         bboxes, scores, ndet, resolution, intervals, provisional_infos,
     )
-    scene_valid = [_scene_fraction(keep_vote, interval) >= 0.5 for interval in intervals]
+    scene_valid = [
+        _scene_fraction(keep_vote, interval) >= SCENE_VALID_MIN_FRACTION
+        for interval in intervals
+    ]
     court_present = build_court_present(keep_vote, intervals, scene_valid)
     static_corners_refpx = inputs.active_corners_refpx
     static_corners_px = _as_native_corners(static_corners_refpx)
@@ -564,29 +579,6 @@ def build_static_court_evidence(
         for scene_index, ((start, end), valid) in enumerate(zip(intervals, scene_valid))
     )
     return CourtEvidenceResult(inputs, records, keep_vote, court_present, None)
-
-
-def build_detected_court_inputs(
-    video_id: int | str,
-    resolution: tuple[float, float],
-    raw_cuts: Sequence[tuple[int, int]] | pd.DataFrame,
-    scene_evidence: Sequence[SceneEvidence],
-    bboxes: np.ndarray,
-    scores: np.ndarray,
-    ndet: np.ndarray,
-    *,
-    detector_resolution: tuple[float, float] = DETECTOR_RESOLUTION,
-    gate_resolution_table: pd.DataFrame | None = None,
-    ref_err_px: float = 3.5,
-) -> CourtInputs:
-    """Build the detected parent and return only its operational inputs."""
-    result = build_detected_court_evidence(
-        '', '', video_id, resolution, raw_cuts, scene_evidence, bboxes, scores, ndet,
-        detector_resolution=detector_resolution,
-        gate_resolution_table=gate_resolution_table,
-        ref_err_px=ref_err_px,
-    )
-    return cast(CourtInputs, result.inputs)
 
 
 def build_detected_court_evidence(
@@ -621,7 +613,8 @@ def build_detected_court_evidence(
         bboxes, scores, ndet, resolution, intervals, provisional_infos,
     )
     scene_valid = [
-        corners is not None and _scene_fraction(keep_vote, interval) >= 0.5
+        corners is not None
+        and _scene_fraction(keep_vote, interval) >= SCENE_VALID_MIN_FRACTION
         for corners, interval in zip(native_corners, intervals)
     ]
     court_present = build_court_present(keep_vote, intervals, scene_valid)

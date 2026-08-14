@@ -11,8 +11,19 @@ from scraper.config import SCRAPE_TRACKNET_LARGE_VIDEO, SCRAPE_TRACKNET_STRIDE
 from annotator.resolve import resolve
 from annotator.run_video import AnnotatorResult
 
-def test_stage9_main_scales_composition_min_scene_len(monkeypatch, tmp_path: Path) -> None:
-    import annotator.composition_mask as stage9
+
+def test_rally_dead_mask_loader_keeps_dead_mask_filename(tmp_path: Path) -> None:
+    from annotator.rally import cli
+
+    expected = np.array([True, False, True], dtype=bool)
+    np.save(tmp_path / 'video-1_dead_mask.npy', expected)
+
+    np.testing.assert_array_equal(cli._load_dead_mask(tmp_path, 'video-1'), expected)
+    assert cli._load_dead_mask(tmp_path, 'missing') is None
+
+
+def test_composition_mask_main_scales_composition_min_scene_len(monkeypatch, tmp_path: Path) -> None:
+    import annotator.composition_mask as composition_mask
 
     keep_vote_path = tmp_path / 'keep_vote.npy'
     np.save(keep_vote_path, np.ones(200, dtype=bool))
@@ -22,16 +33,16 @@ def test_stage9_main_scales_composition_min_scene_len(monkeypatch, tmp_path: Pat
         captured.append(min_scene_len)
         return np.array([100], dtype=int)
 
-    monkeypatch.setattr(stage9, 'detect_cuts', fake_detect_cuts)
-    monkeypatch.setattr(stage9, 'probe_fps', lambda _video: 50.0)
+    monkeypatch.setattr(composition_mask, 'detect_cuts', fake_detect_cuts)
+    monkeypatch.setattr(composition_mask, 'probe_fps', lambda _video: 50.0)
     common = [
         '--video-id', 'video-1', '--video', str(tmp_path / 'unused.mp4'),
         '--keep-vote', str(keep_vote_path), '--out-dir', str(tmp_path / 'masks'),
     ]
-    monkeypatch.setattr(sys, 'argv', ['stage9', *common, '--fps', '60'])
-    stage9.main()
-    monkeypatch.setattr(sys, 'argv', ['stage9', *common])
-    stage9.main()
+    monkeypatch.setattr(sys, 'argv', ['composition_mask', *common, '--fps', '60'])
+    composition_mask.main()
+    monkeypatch.setattr(sys, 'argv', ['composition_mask', *common])
+    composition_mask.main()
 
     assert captured == [30, 25]
 
@@ -44,15 +55,15 @@ def test_stage9_main_scales_composition_min_scene_len(monkeypatch, tmp_path: Pat
         (['--fps', '60'], 24),
     ],
 )
-def test_stage8_main_resolves_fps_thresholds(
+def test_rally_segmentation_main_resolves_fps_thresholds(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
     fps_args: list[str],
-    expected_impulse: int,
+    expected_impulse: int | None,
 ) -> None:
     import annotator.run_video as run_video_module
-    import annotator.rally_segmentation as stage8
+    import annotator.rally_segmentation as rally_segmentation
 
     shuttle_dir = tmp_path / 'shuttles'
     shuttle_dir.mkdir()
@@ -78,8 +89,12 @@ def test_stage8_main_resolves_fps_thresholds(
         args.extend(fps_args)
     if '--missing-id' in fps_args:
         (shuttle_dir / 'video-1.npy').rename(shuttle_dir / 'missing-id.npy')
-    monkeypatch.setattr(sys, 'argv', ['stage8', *args])
-    stage8.main()
+    monkeypatch.setattr(sys, 'argv', ['rally_segmentation', *args])
+    if expected_impulse is None:
+        with pytest.raises(RuntimeError, match='processed 0 of 1 video'):
+            rally_segmentation.main()
+    else:
+        rally_segmentation.main()
 
     if expected_impulse is not None:
         assert captured[0].impulse_floor_half_window_frames == expected_impulse
@@ -90,14 +105,16 @@ def test_stage8_main_resolves_fps_thresholds(
     if '--missing-id' in fps_args:
         assert not captured
         assert 'skipping missing-id: absent from fps CSV' in caplog.text
+        assert not (tmp_path / 'spans.csv').exists()
+        assert not (tmp_path / 'contacts.csv').exists()
 
 
-def test_stage8_main_serialises_split_verdicts_to_csv(
+def test_rally_segmentation_main_serialises_split_verdicts_to_csv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """The contacts CSV carries both verdict columns, blank on the no-gate path."""
     import annotator.run_video as run_video_module
-    import annotator.rally_segmentation as stage8
+    import annotator.rally_segmentation as rally_segmentation
     from annotator.types import ContactCandidate
 
     shuttle_dir = tmp_path / 'shuttles'
@@ -115,11 +132,11 @@ def test_stage8_main_serialises_split_verdicts_to_csv(
 
     monkeypatch.setattr(run_video_module, 'run_video', fake_run_video)
     monkeypatch.setattr(sys, 'argv', [
-        'stage8', '--shuttle-dir', str(shuttle_dir), '--fps', '30',
+        'rally_segmentation', '--shuttle-dir', str(shuttle_dir), '--fps', '30',
         '--rally-spans-csv', str(tmp_path / 'spans.csv'),
         '--contact-frames-csv', str(contacts_csv),
     ])
-    stage8.main()
+    rally_segmentation.main()
 
     assert contacts_csv.read_text(encoding='utf-8').splitlines() == [
         'video_id,rally_id,contact_frame,proximity_ok,wrist_near,suppressed',
@@ -130,39 +147,19 @@ def test_stage8_main_serialises_split_verdicts_to_csv(
     ]
 
 
-@pytest.mark.parametrize(
-    'retired_option',
-    ['--gate-dir', '--pose-dir', '--homography-csv', '--resolution-csv',
-     '--court-box-csv', '--thresholds'],
-)
-def test_stage8_main_rejects_retired_options(monkeypatch, tmp_path, retired_option):
-    import annotator.rally_segmentation as stage8
-
-    shuttle_dir = tmp_path / 'shuttles'
-    shuttle_dir.mkdir()
-    option_value = 'shipped' if retired_option == '--thresholds' else str(tmp_path / 'retired')
-    monkeypatch.setattr(sys, 'argv', [
-        'stage8', '--shuttle-dir', str(shuttle_dir), '--fps', '30',
-        retired_option, option_value,
-    ])
-
-    with pytest.raises(SystemExit, match='2'):
-        stage8.main()
-
-
-def test_stage8_main_requires_an_fps_source(
+def test_rally_segmentation_main_requires_an_fps_source(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
 ) -> None:
-    import annotator.rally_segmentation as stage8
+    import annotator.rally_segmentation as rally_segmentation
 
     shuttle_dir = tmp_path / 'shuttles'
     shuttle_dir.mkdir()
     monkeypatch.setattr(sys, 'argv', [
-        'stage8', '--shuttle-dir', str(shuttle_dir), '--rally-spans-csv', str(tmp_path / 'spans.csv'),
+        'rally_segmentation', '--shuttle-dir', str(shuttle_dir), '--rally-spans-csv', str(tmp_path / 'spans.csv'),
         '--contact-frames-csv', str(tmp_path / 'contacts.csv'),
     ])
     with pytest.raises(SystemExit, match='2'):
-        stage8.main()
+        rally_segmentation.main()
     assert 'one of --fps or --fps-csv is required' in capsys.readouterr().err
 
 
@@ -198,7 +195,7 @@ def test_extract_shuttle_builds_tracknet_command(
     captured = []
 
     def fake_run(cmd, **kwargs):
-        captured.append(cmd)
+        captured.append((cmd, kwargs))
         (save_dir / 'clip_ball.csv').parent.mkdir(parents=True, exist_ok=True)
         (save_dir / 'clip_ball.csv').touch()
 
@@ -206,9 +203,11 @@ def test_extract_shuttle_builds_tracknet_command(
     shuttle.extract_shuttle(video_path, save_dir, weights_dir, tracknet_stride=stride,
                             large_video=large_video)
 
-    argv = captured[0]
+    argv, run_kwargs = captured[0]
     assert ['--eval_mode', expected_mode] == argv[argv.index('--eval_mode'):argv.index('--eval_mode') + 2]
     assert ('--large_video' in argv) is present
+    expected_dir = Path(shuttle.__file__).resolve().parents[2] / 'shared' / 'tracknetv3'
+    assert run_kwargs['cwd'] == expected_dir
 
 
 def test_extract_shuttle_rejects_stride_three(tmp_path: Path) -> None:
@@ -242,6 +241,7 @@ def test_batch_shuttle_extractor_builds_tracknet_command(
     (tracknet_dir / 'ckpts').mkdir(parents=True)
     (tracknet_dir / 'batch_predict.py').touch()
     (tracknet_dir / 'ckpts' / 'TrackNet_best.pt').touch()
+    (tracknet_dir / 'ckpts' / 'InpaintNet_best.pt').touch()
     clips_dir = tmp_path / 'clips'
     clips_dir.mkdir()
     (clips_dir / 'clip.mp4').touch()
@@ -275,6 +275,53 @@ def test_batch_shuttle_extractor_builds_tracknet_command(
     argv = captured[0]
     assert argv[argv.index('--eval_mode') + 1] == expected_mode
     assert ('--large_video' in argv) is present
+    assert '--inpaintnet_file' in argv
+
+
+def test_batch_shuttle_extractor_accepts_an_explicit_non_mp4_video(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import src.bst_x.pipeline.shuttle_extractor as extractor
+
+    tracknet_dir = tmp_path / 'tracknet'
+    (tracknet_dir / 'ckpts').mkdir(parents=True)
+    (tracknet_dir / 'batch_predict.py').touch()
+    (tracknet_dir / 'ckpts' / 'InpaintNet_best.pt').touch()
+    model = tmp_path / 'tracknet.pt'
+    model.touch()
+    video = tmp_path / 'selected.mkv'
+    video.touch()
+    output_dir = tmp_path / 'csv'
+    captured = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(
+        extractor.subprocess,
+        'Popen',
+        lambda args, **_kwargs: captured.append(args) or FakeProcess(),
+    )
+
+    extractor.extract_all_shuttles(
+        tracknet_dir=tracknet_dir,
+        clips_dir=tmp_path / 'unused',
+        video_paths=[video],
+        output_csv_dir=output_dir,
+        model_path=model,
+        max_workers=1,
+        dry_run=True,
+        enable_inpainting=False,
+    )
+
+    argv = captured[0]
+    list_path = Path(argv[argv.index('--video_list') + 1])
+    assert list_path.parent == output_dir
+    assert '--inpaintnet_file' not in argv
 
 
 @pytest.mark.parametrize(
@@ -312,11 +359,15 @@ def test_batch_shuttle_extractor_main_resolves_profiles(
     assert captured[0]['large_video'] is expected_large_video
 
 
-def test_bric_api_pins_tracknet_modes() -> None:
-    bric_inference = pytest.importorskip(
-        'src.api.bric_inference',
-        reason='BRIC API runtime dependencies are unavailable in this test environment',
-    )
-    assert bric_inference._EVAL_MODE_BY_STRIDE == {1: 'weight', 8: 'nonoverlap'}
-    assert bric_inference.TRACKNET_STRIDE == 1
-    assert bric_inference.TRACKNET_LARGE_VIDEO is False
+def test_batch_shuttle_extractor_defaults_to_shared_tracknet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.bst_x.pipeline.shuttle_extractor as extractor
+
+    captured = []
+    monkeypatch.setattr(extractor, 'extract_all_shuttles', lambda **kwargs: captured.append(kwargs))
+    monkeypatch.setattr(sys, 'argv', ['shuttle_extractor', '--dry-run'])
+
+    extractor.main()
+
+    assert captured[0]['tracknet_dir'] == extractor.DEFAULT_TRACKNET_DIR

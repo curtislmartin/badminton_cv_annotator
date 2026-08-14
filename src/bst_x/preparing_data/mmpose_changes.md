@@ -3,7 +3,7 @@
 This documents the OpenMMLab-based extraction path that produced the committed
 keypoint dataset. Nothing in the live pipeline runs it: the 2D path runs rtmlib
 (`docs/architecture_notes/rtmlib_migration/`) and the 3D stream was removed
-(parked design: `docs/architecture_notes/completed_general_refactors/structure_and_guards_pass/pose_3d_stream_design.md`,
+(parked design: `docs/archive/completed_general_refactors/structure_and_guards_pass/pose_3d_stream_design.md`,
 env: `requirements-legacy-3d.txt`).
 
 This directory bridges the pipeline's clip output and BST-X's expected input format. The pose extraction code in `prepare_train_on_shuttleset.py` runs MMPose on ~33k short clips to produce per-clip skeleton keypoints, court positions, and shuttle trajectories.
@@ -67,7 +67,7 @@ Added `gc.collect()` + `torch.cuda.empty_cache()` after each clip in both the 2D
 - Expanded comment on the 3D inferencer per-clip reload bug workaround (lines 320-326)
 - Refactored `detect_players_2d()` from nested if-else to early-return with `continue` (functionally identical)
 
-The earlier `if __name__ == '__main__': sys.path.append(...)` scaffolding for `python -m preparing_data.prepare_train_on_shuttleset` was removed by the pre-phase-2 proper-packages refactor (step P). The new invocation expects `PYTHONPATH=src/bst_x` (the same pair `conftest.py` uses for tests) and is documented in the script's module docstring.
+The earlier `if __name__ == '__main__': sys.path.append(...)` scaffolding for `python -m preparing_data.prepare_train_on_shuttleset` was removed by the pre-phase-2 proper-packages refactor (step P). The current invocation expects `PYTHONPATH=src:src/bst_x`, matching the roots inserted by `conftest.py`.
 
 ---
 
@@ -77,15 +77,15 @@ Every helper function in the pose processing chain is byte-identical:
 
 | Function | Module | Purpose |
 |----------|--------|---------|
-| `get_H()` | `pipeline/court_utils.py` | Extract homography matrix from DataFrame |
-| `get_corner_camera()` | `pipeline/court_utils.py` | Extract court corner coordinates |
-| `scale_pos_by_resolution()` | `pipeline/court_utils.py` | Scale coordinates to 1280x720 reference |
-| `convert_homogeneous()` | `pipeline/court_utils.py` | Convert to homogeneous coordinates |
-| `project()` | `pipeline/court_utils.py` | Apply homography projection |
-| `get_court_info()` | `pipeline/court_utils.py` | Build court info dict (homography + boundaries) |
-| `to_court_coordinate()` | `pipeline/court_utils.py` | Camera-to-court coordinate transform |
-| `normalize_position()` | `pipeline/court_utils.py` | Normalize by court boundaries to [0, 1] |
-| `check_pos_in_court()` | `pipeline/court_utils.py` | Determine which detected people are on court (re-exported from `prepare_train_on_shuttleset` so the heuristics' lazy import path stays valid) |
+| `get_H()` | `shared/court.py` | Extract homography matrix from DataFrame |
+| `get_corner_camera()` | `shared/court.py` | Extract court corner coordinates |
+| `scale_pos_by_resolution()` | `shared/court.py` | Scale coordinates to 1280x720 reference |
+| `convert_homogeneous()` | `shared/court.py` | Convert to homogeneous coordinates |
+| `project()` | `shared/court.py` | Apply homography projection |
+| `get_court_info()` | `shared/court.py` | Build court info dict (homography + boundaries) |
+| `to_court_coordinate()` | `shared/court.py` | Camera-to-court coordinate transform |
+| `normalize_position()` | `shared/court.py` | Normalize by court boundaries to [0, 1] |
+| `check_pos_in_court()` | `shared/court.py` | Determine which detected people are on court (re-exported from `prepare_train_on_shuttleset` for its indirect consumer) |
 | `normalize_joints()` | `preparing_data/prepare_train_on_shuttleset.py` | Normalize keypoints by bbox diagonal or video height |
 | `normalize_shuttlecock()` | `preparing_data/prepare_train_on_shuttleset.py` | Normalize by video resolution to [0, 1] |
 | `get_shuttle_result()` | `preparing_data/prepare_train_on_shuttleset.py` | Read TrackNetV3 CSV and normalize |
@@ -157,7 +157,7 @@ For each clip, `detect_players_2d()`:
 
 ### Output format per clip
 
-Files land flat under `save_root_dir`, one set per clip stem. Split and label assignment come from `notebooks/clips_master.csv` at collation time, not from the on-disk directory layout. See `docs/architecture_notes/completed_general_refactors/dir_flatten_refactor.md` for the flatten refactor.
+Files land flat under `save_root_dir`, one set per clip stem. Split and label assignment come from `notebooks/clips_master.csv` at collation time, not from the on-disk directory layout. See `docs/archive/completed_general_refactors/dir_flatten_refactor.md` for the flatten refactor.
 
 | File | Shape | Contents |
 |------|-------|----------|

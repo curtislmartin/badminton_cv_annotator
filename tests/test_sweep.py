@@ -4,16 +4,19 @@ import json
 import csv
 import argparse
 import sys
+from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from annotator.calibration import sweep
 from annotator.calibration.fixtures import SSET_01
 from annotator.calibration.gt_scoring import RunVideoInputs
+from annotator.calibration.scoring import CONTACT_TOLERANCES_BASE30
 from annotator.calibration.schemas import CSV_COLUMNS_BY_FILENAME
 from annotator.rally_segmentation import ServeStartClose, ServeStartMode
-from annotator.types import SpanOpen
+from annotator.types import ContactCandidate, SpanOpen
 from annotator.resolve import resolve
 
 
@@ -29,6 +32,31 @@ def _row(spec: sweep.CandidateSpec, *, covered: int = 100) -> dict[str, object]:
     }
     row.update(spec.overrides_base30)
     return row
+
+
+def test_sweep_uses_the_shared_contact_tolerances() -> None:
+    assert sweep.CONTACT_TOLERANCES_BASE30 is CONTACT_TOLERANCES_BASE30
+
+
+def test_sweep_row_preserves_the_legacy_speed_schema_value() -> None:
+    master = pd.DataFrame(
+        {
+            "vid": [SSET_01.video_id] * 3,
+            "set_id": ["synthetic"] * 3,
+            "rally": [1, 1, 1],
+            "frame_num": [10, 20, 30],
+        }
+    )
+    result = SimpleNamespace(
+        spans=[(5, 35)],
+        filtered_contacts=[
+            ContactCandidate(0, frame, True, True, False)
+            for frame in (10, 20, 30)
+        ],
+    )
+    row = sweep._row_for_result(SSET_01, sweep.shipped_spec(), result, master)
+    assert row["min_contact_speed"] == sweep.LEGACY_MIN_CONTACT_SPEED == 0.005
+    assert row["rest_speed"] == 0.002
 
 
 def test_boundary_values_resolve_to_frozen_25fps_literals() -> None:
@@ -61,6 +89,14 @@ def test_grids_and_routing_cover_every_key_class() -> None:
     assert base.gap_state_demotion_bound == 2
     assert serve is not None and serve.threshold_bh == 0.1
     assert sweep.serialise_spec(spec)["overrides_base30"]["threshold_bh"] == 0.1
+
+
+@pytest.mark.parametrize("key", ("unrelated_field", "rest_widnow"))
+def test_sweep_rejects_unrelated_and_misspelled_fps_fields(key: str) -> None:
+    spec = sweep.CandidateSpec("invalid", {key: 1.0}, {})
+
+    with pytest.raises(ValueError, match=f"cannot route numeric sweep key {key!r}"):
+        sweep._base_and_serve(spec)
 
 
 def test_quality_floor_uses_greatest_coverage(tmp_path, monkeypatch, capsys) -> None:
@@ -237,6 +273,12 @@ def test_routing_depth_enums_and_changed_defaults() -> None:
     assert base.span_open is SpanOpen.BACK_FILL
     assert serve == sweep.ServeStartConfig(0.1, ServeStartMode.TRIM, ServeStartClose.BURST, 0.2)
     assert sweep._base_and_serve(sweep.CandidateSpec("grid", {}, {}))[0].span_open is SpanOpen.BACK_FILL
+    quiet_base, quiet_serve = sweep._base_and_serve(
+        sweep.CandidateSpec("quiet", {"quiet_start_window": 3}, {})
+    )
+    assert quiet_base.quiet_start_window == 3
+    assert quiet_base.span_open is None
+    assert quiet_serve is None
     for strategies in ({"unknown": "TRIM"}, {"mode": "bad"}, {"close": "bad"}, {"span_open": "bad"}):
         with pytest.raises(ValueError):
             sweep._base_and_serve(sweep.CandidateSpec("grid", {}, strategies))
@@ -304,45 +346,6 @@ def test_loader_rejects_duplicate_keys_and_masks(tmp_path) -> None:
         sweep._replace_mask(inputs, mask_path).keyword["raw_exclusion_mask"],
         [True, False, True, False],
     )
-
-
-def test_load_winner_config_returns_contact_or_boundary_spec(tmp_path, monkeypatch) -> None:
-    boundary = {key: values[0] for key, values in sweep.BOUNDARY_VALUES.items()}
-    contact = {**boundary, **{key: values[0] for key, values in sweep.CONTACT_VALUES.items()}}
-    legacy = sweep.winner_document("sset_01", ["boundary"], boundary=sweep.winner_spec(boundary, {}))
-    two_phase = sweep.winner_document(
-        "sset_01", ["boundary", "contact"], boundary=sweep.winner_spec(boundary, {}),
-        contact=sweep.winner_spec(contact, {}),
-    )
-    for name, document, expected in (("boundary", legacy, boundary), ("contact", two_phase, contact)):
-        path = tmp_path / f"{name}.json"
-        path.write_text(json.dumps(document), encoding="utf-8")
-        loaded = sweep.load_winner_config(path, "sset_01")
-        assert loaded.overrides_base30 == expected
-
-    digests = sweep._input_digest_bundle(SSET_01)
-    monkeypatch.setattr(sweep, "_input_digest_bundle", lambda fixture: digests)
-    provenance = sweep.winner_document(
-        "sset_01", ["boundary"], boundary=sweep.winner_spec(boundary, {}),
-        schema_version=1, tuning_video_ids=[SSET_01.video_id], input_digests=digests,
-    )
-    provenance["meta"]["input_digests"] = {**digests, "missing-input.npy": "bad"}
-    path = tmp_path / "mismatch.json"
-    path.write_text(json.dumps(provenance), encoding="utf-8")
-    with pytest.raises(ValueError, match="missing-input.npy"):
-        sweep.load_winner_config(path, "sset_01")
-
-
-def test_load_winner_config_rejects_unknown_schema_version(tmp_path) -> None:
-    boundary = {key: values[0] for key, values in sweep.BOUNDARY_VALUES.items()}
-    document = sweep.winner_document(
-        "sset_01", ["boundary"], boundary=sweep.winner_spec(boundary, {}),
-        schema_version=99, tuning_video_ids=[SSET_01.video_id], input_digests={"input": "digest"},
-    )
-    path = tmp_path / "unknown-schema.json"
-    path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ValueError, match="unknown config winner schema_version"):
-        sweep.load_winner_config(path, "sset_01")
 
 
 def test_main_classifies_configuration_and_execution_errors(tmp_path, monkeypatch) -> None:

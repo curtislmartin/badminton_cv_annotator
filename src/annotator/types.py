@@ -1,10 +1,10 @@
-"""Shared annotator declarations: fps scaling, storage slots, and the stage
-8/point-winner shuttle-track primitives and pose-array conventions shared
-across stages.
+"""Shared annotator declarations for FPS scaling and storage slots.
+
+This module also owns shuttle-track primitives and pose-array conventions used
+by rally segmentation and point-winner attribution.
 """
 from __future__ import annotations
 
-import math
 import warnings
 from enum import IntEnum, StrEnum
 from typing import TYPE_CHECKING, NamedTuple
@@ -12,33 +12,10 @@ from typing import TYPE_CHECKING, NamedTuple
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
-from .fps_constants import BASE_FPS
+from .fps_constants import ScalingKind as ScalingKind
 
 if TYPE_CHECKING:
     from .rally_segmentation import ServeStartClose, ServeStartMode
-
-
-class ScalingKind(StrEnum):
-    """Describe how a base-30 value scales with the video's frame rate.
-
-    Per-frame speeds shrink as fps rises, frame counts grow, dimensionless
-    values never scale; arithmetic must stay identical to ``scale_for_fps``
-    until the threading stage rewires the table onto these declarations.
-    """
-
-    PER_FRAME_SPEED = 'per_frame_speed'
-    FRAME_COUNT = 'frame_count'
-    DIMENSIONLESS = 'dimensionless'
-
-    def scale(self, value: float, fps: float) -> float | int:
-        """Scale one base-30 value, requiring a positive finite frame rate."""
-        if not math.isfinite(fps) or fps <= 0:
-            raise ValueError(f'fps must be positive and finite, got {fps!r}')
-        if self is ScalingKind.PER_FRAME_SPEED:
-            return value * BASE_FPS / fps
-        if self is ScalingKind.FRAME_COUNT:
-            return max(1, math.floor(value * fps / BASE_FPS + 0.5))
-        return value
 
 
 class DeadMaskMode(StrEnum):
@@ -112,7 +89,7 @@ class Slot(IntEnum):
 
 
 # ---------------------------------------------------------------------------
-# Shared shuttle-track primitives (stage 8 and stage 9 both import these)
+# Shared shuttle-track primitives (rally segmentation and replay masking both import these)
 # ---------------------------------------------------------------------------
 def compute_speed(track: np.ndarray) -> np.ndarray:
     """Per-frame shuttle speed, NaN where the step is not fully visible.
@@ -140,7 +117,7 @@ def true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     """Maximal runs of True in a boolean mask, as half-open `[start, end)` ranges.
 
     Vectorised via edge detection on the zero-padded int mask: +1 marks a run
-    start, -1 marks one-past a run end. Shared with stage 9's court-absence
+    start, -1 marks one-past a run end. Shared with replay masking's court-absence
     signal, which masks whole absent runs.
 
     :param mask: `(t,)` boolean.
@@ -158,7 +135,7 @@ def rolling_nanmedian(values: np.ndarray, window: int) -> np.ndarray:
 
     Pads both ends with NaN so every frame gets a full-width window and the
     output keeps length t; nanmedian drops the pad and any NaN steps. Shared
-    with stage 9's slow-motion signal.
+    with replay masking's slow-motion signal.
 
     :param values: `(t,)` values, may contain NaN.
     :param window: window width in frames.
@@ -175,7 +152,7 @@ def rolling_nanmedian(values: np.ndarray, window: int) -> np.ndarray:
         return np.nanmedian(windows, axis=1)
 
 
-# COCO wrist/ankle keypoint indices in the (t, n_max, 17, 2) pose keypoint arrays. Stage 8
+# COCO wrist/ankle keypoint indices in the (t, n_max, 17, 2) pose keypoint arrays. Rally segmentation
 # (rally_segmentation.py) and point_winner both read these for the sticky picker, attribution
 # and landing kinematics.
 WRIST_L, WRIST_R = 9, 10
@@ -183,7 +160,28 @@ ANKLE_L, ANKLE_R = 15, 16
 
 
 class StickyResult(NamedTuple):
-    """Cached sticky evidence. ``bbox_height`` is in pixels."""
+    """Frame-aligned evidence from the sticky player picker.
+
+    The second axis of every per-slot field is ``[TOP, BOTTOM]``.
+
+    :param distances: ``(t,)`` nearest finite wrist gap in body-height units;
+        positive infinity outside analysed segments and NaN when an analysed
+        frame has no finite picked-player gap.
+    :param picks: ``(t, 2)`` raw pose-slot indices; ``-1`` means no accepted
+        player for that court half.
+    :param standing_count: ``(t,)`` number of standing in-court detections.
+    :param ankle_pos: ``(t, 2, 2)`` mean ankle ``[x, y]`` normalised by video
+        resolution; NaN where no player was picked.
+    :param bbox_height: ``(t, 2)`` picked-player box heights in pixels; NaN
+        where no player was picked.
+    :param distances_per_slot: ``(t, 2)`` wrist gaps in body-height units before
+        the nearest-slot collapse, with the same infinity and NaN sentinels as
+        ``distances``.
+    :param wrist_dist_px: ``(t, 2)`` wrist gaps in pixels on visible shuttle
+        frames; positive infinity outside analysed segments and NaN when
+        unavailable inside them.
+    :param analysed: ``(t,)`` boolean mask of frames visited by the picker.
+    """
 
     distances: np.ndarray
     picks: np.ndarray

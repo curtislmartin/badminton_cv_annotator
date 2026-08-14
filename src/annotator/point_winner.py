@@ -1,4 +1,4 @@
-"""Stage 10: point-winner verdicts (D5 chain — attribution, alternation fit, landing, verdict).
+"""Point-winner verdicts (D5 chain — attribution, alternation fit, landing, verdict).
 
 Wrist-anchored striker attribution in body-height units, an alternation-rhythm fit for the
 final-contact half, a kinematic landing filter (a settle cap plus a carry filter, both refined by
@@ -18,17 +18,16 @@ play would break. That assumption rides the measured configuration and is not a 
 
 Library-only: no argparse main. Every function here reads precomputed per-video arrays (a shuttle
 track, court-scale pose boxes, a replay/dead mask, a homography) for one rally or one frame at a
-time; there is no established pipeline path convention yet for wiring stage 8/9's outputs into a
-point-winner CLI, so this stays a library the caller composes over a rally list, the way the
+time; there is no established path convention yet for wiring rally-segmentation and replay-mask
+outputs into a point-winner CLI, so this stays a library the caller composes over a rally list, the way the
 harness's own per-rally loop does. See
-local_scratch/autograder_architecture/d5_stage10_pin.py for a runnable example that reproduces the
-D5 retest's arm-2 verdict CSVs from this module.
+the pinned D5 example under local_scratch/autograder_architecture for a runnable reproduction of
+the D5 retest's arm-2 verdict CSVs from this module.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-import math
 from typing import NamedTuple
 
 import numpy as np
@@ -53,7 +52,7 @@ from .types import (
     rolling_nanmedian,
     true_runs,
 )
-from .fps_constants import FpsConstants
+from .fps_constants import FpsConstants, ScalingKind
 
 
 class Half(StrEnum):
@@ -91,12 +90,7 @@ SINGLES_INSET_M = 0.46
 SINGLES_X_LO = SINGLES_INSET_M / COURT_WIDTH_M          # ~0.07541
 SINGLES_X_HI = 1.0 - SINGLES_INSET_M / COURT_WIDTH_M    # ~0.92459
 NET_COURT_Y = 0.5
-
-# Landing-window constants. A sustained track loss is a run of >= this many consecutive invisible
-# frames (mirrors stage 8's BLIP_MAX_FRAMES, a gap longer than a blip); the descending run needs
-# >= 3 visible samples.
-SUSTAINED_LOSS_FRAMES = 10
-MIN_DESCEND_SAMPLES = 3
+SHUTTLESET_TO_COURTKEYNET_CORNER_ORDER = (0, 1, 3, 2)
 
 # Image-y fraction that counts as the frame's TOP edge for the window fix (a lob that exits the
 # top leaves its last visible sample this close to y=0). Also the terminal-at-border threshold
@@ -307,7 +301,7 @@ def _at_frame_border(xy: np.ndarray) -> bool:
 # Purpose: the "last descending run" a naive search keeps is often the post-rally pickup / carry /
 # toss-back, whose ELEVATED terminal (shuttle in a hand, mid-air) projects past the far baseline
 # through the floor homography and lands the verdict in the wrong court half. This filter excludes
-# fallen/carried shuttle spans from the descending-run search KINEMATICALLY, repurposing stage 8's
+# fallen/carried shuttle spans from the descending-run search KINEMATICALLY, repurposing rally segmentation's
 # serve gate's low-displacement-over-a-window machinery (its body-height form) into two signals:
 #   - SETTLE: the shuttle goes static (self-speed rolling-median <= settle_thr) for >= settle_min
 #     frames and is NOT held at a wrist (the "not a trajectory inversion around the nearest wrist"
@@ -369,16 +363,25 @@ class LandingFilterOptions(NamedTuple):
     use_ankle_rule: bool = True
 
 
+SHIPPED_LANDING_FILTER_OPTIONS = LandingFilterOptions(
+    settle_win=7,
+    settle_thr=0.004,
+    settle_min=5,
+    carry_win=7,
+    carry_thr=0.75,
+)
+
+
 def convert_landing_options(opts: LandingFilterOptions, fps: float) -> LandingFilterOptions:
     """Convert base-30 landing options once; returned fields are final fps values."""
-    if fps <= 0 or not math.isfinite(fps):
-        raise ValueError(f'fps must be positive and finite, got {fps!r}')
-    time = lambda value: max(1, math.floor(value * fps / 30.0 + 0.5))
+    def frame_count(value: int) -> int:
+        return int(ScalingKind.FRAME_COUNT.scale(value, fps))
+
     return opts._replace(
-        settle_win=time(opts.settle_win),
-        settle_thr=opts.settle_thr * 30.0 / fps,
-        settle_min=time(opts.settle_min),
-        carry_win=time(opts.carry_win),
+        settle_win=frame_count(opts.settle_win),
+        settle_thr=float(ScalingKind.PER_FRAME_SPEED.scale(opts.settle_thr, fps)),
+        settle_min=frame_count(opts.settle_min),
+        carry_win=frame_count(opts.carry_win),
     )
 
 
@@ -583,19 +586,12 @@ def inout_verdict(landing_norm: np.ndarray, receiver_half: Half, margin_m: float
     the four boundary lines are converted to metres (x*6.10, y*13.40). Inside with every
     clearance > M => won; outside (point-to-rectangle distance) by > M => lost; else null.
     """
-    x, y = float(landing_norm[0]), float(landing_norm[1])
-    y_lo, y_hi = (NET_COURT_Y, 1.0) if receiver_half == Half.BOT else (0.0, NET_COURT_Y)
-
-    clear_xlo = (x - SINGLES_X_LO) * COURT_WIDTH_M
-    clear_xhi = (SINGLES_X_HI - x) * COURT_WIDTH_M
-    clear_ylo = (y - y_lo) * COURT_LENGTH_M
-    clear_yhi = (y_hi - y) * COURT_LENGTH_M
-    if min(clear_xlo, clear_xhi, clear_ylo, clear_yhi) > margin_m:
+    signed_margin = landing_margins(
+        (float(landing_norm[0]), float(landing_norm[1])), receiver_half,
+    ).margin_m
+    if signed_margin > margin_m:
         return Verdict.WON
-
-    out_x = max(0.0, (SINGLES_X_LO - x), (x - SINGLES_X_HI)) * COURT_WIDTH_M
-    out_y = max(0.0, (y_lo - y), (y - y_hi)) * COURT_LENGTH_M
-    if float(np.hypot(out_x, out_y)) > margin_m:
+    if signed_margin < -margin_m:
         return Verdict.LOST
     return None  # within +/-M of a boundary line
 
@@ -616,7 +612,7 @@ class LandingMargins(NamedTuple):
 
 
 def landing_margins(landing_norm: tuple[float, float], receiver_half: Half) -> LandingMargins:
-    """Court-metre clearances for a landing, reusing inout_verdict's boundary geometry."""
+    """Court-metre clearances for a landing against the receiver's singles half."""
     x, y = float(landing_norm[0]), float(landing_norm[1])
     y_lo, y_hi = (NET_COURT_Y, 1.0) if receiver_half == Half.BOT else (0.0, NET_COURT_Y)
     baseline_y = y_hi if receiver_half == Half.BOT else y_lo  # the non-net y edge = receiver baseline
@@ -664,7 +660,12 @@ def corner_error_band_from_corners(
     return float(np.median(displacements))
 
 
-def corner_error_band_m(vid: int, homo_df: pd.DataFrame, court_info: dict, err_px: float) -> float:
+def corner_error_band_m(
+    vid: int | str,
+    homo_df: pd.DataFrame,
+    court_info: dict,
+    err_px: float,
+) -> float:
     """Corner error (refpx) propagated to court metres at the recorded-corner (line) locations.
 
     Shifts each recorded corner by err_px along +/-x and +/-y, re-projects it through the SAME
@@ -679,7 +680,7 @@ def corner_error_band_m(vid: int, homo_df: pd.DataFrame, court_info: dict, err_p
     :param err_px: assumed corner-marking error, in the recorded homography's own pixel space.
     """
     source_order = get_corner_camera(homo_df.loc[vid]).T
-    corners = source_order[[0, 1, 3, 2]]
+    corners = source_order[list(SHUTTLESET_TO_COURTKEYNET_CORNER_ORDER)]
     return corner_error_band_from_corners(corners, court_info, err_px)
 
 
@@ -730,31 +731,6 @@ def pick_landing_to_end(
         frame=landing_frame, norm=norm, half=half,
         at_border=_at_frame_border(landing_xy),
         net_ender=is_net_ender(final_contact, end_frame, track, striker_half, net_band, resolution),
-    )
-
-
-def pick_landing(
-    final_contact: int, next_start: int, track: np.ndarray, dead: np.ndarray,
-    kin: LandingKinematics, opts: LandingFilterOptions, striker_half: Half,
-    net_band: tuple[float, float], resolution: tuple[float, float], court_info: dict,
-    constants: FpsConstants, fps: float,
-    shuttle_hallucination_mask: np.ndarray | None = None,
-    rejected_intervals: list[tuple[int, int]] | None = None,
-) -> Landing | None:
-    """The picked landing for one rally: the filtered terminal, projected to court space, with
-    quality flags. None when nothing survives the landing filter within the window.
-
-    ``fps`` must be the rate for which ``constants`` was resolved; it is used only to convert
-    landing options once.
-    """
-    win_end = landing_window(
-        final_contact, next_start, track, dead, constants.sustained_loss_frames,
-        shuttle_hallucination_mask,
-    ).end_frame
-    return pick_landing_to_end(
-        final_contact, win_end, track, kin, opts, striker_half, net_band,
-        resolution, court_info, constants, fps, shuttle_hallucination_mask,
-        rejected_intervals,
     )
 
 

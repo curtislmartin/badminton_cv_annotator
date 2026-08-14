@@ -30,7 +30,7 @@ Usage on bourbaki / engelbart (dual-invocation main-vs-branch):
   # same code. The script sets torch.use_deterministic_algorithms(True);
   # this env var unlocks the same guarantee at the CuBLAS layer.
   export CUBLAS_WORKSPACE_CONFIG=:4096:8
-  export PYTHONPATH=src/bst_x
+  export PYTHONPATH=src:src/bst_x
 
   # STEP 1 -- branch
   git checkout <refactor-branch>
@@ -60,8 +60,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from bst_x_infer import Task
-from pipeline.config import taxonomy_lookup
+SRC_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(SRC_ROOT))
+sys.path.insert(0, str(SRC_ROOT / 'bst_x'))
+
+from bst_x_infer import Task  # noqa: E402
+from classifier_shared.taxonomy import taxonomy_lookup  # noqa: E402
 
 
 def main() -> int:
