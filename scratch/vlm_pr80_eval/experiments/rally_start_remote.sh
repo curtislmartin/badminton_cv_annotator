@@ -105,6 +105,19 @@ case "$BACKEND" in
       --env VLLM_NO_USAGE_STATS=1
     )
     ;;
+  qwen3-8)
+    : "${VLM_QWEN38_IMAGE:?set VLM_QWEN38_IMAGE}"
+    : "${VLM_QWEN38_PYTHON:?set VLM_QWEN38_PYTHON}"
+    image=$VLM_QWEN38_IMAGE
+    python_path=$VLM_QWEN38_PYTHON
+    container_args+=(
+      --env FLASHINFER_WORKSPACE_BASE="$CACHE_ROOT/flashinfer"
+      --env VLLM_CACHE_ROOT="$CACHE_ROOT/vllm"
+      --env VLLM_CONFIG_ROOT="$CACHE_ROOT/vllm-config"
+      --env VLLM_NO_USAGE_STATS=1
+    )
+    timeout_args=()
+    ;;
   internvideo3)
     : "${VLM_INTERN_IMAGE:?set VLM_INTERN_IMAGE}"
     : "${VLM_INTERN_PYTHON:?set VLM_INTERN_PYTHON}"
@@ -118,10 +131,14 @@ case "$BACKEND" in
     ;;
 esac
 
+if [[ $BACKEND != qwen3-8 ]]; then
+  timeout_args=(timeout --kill-after=30s 25m)
+fi
+
 environment_root=$(dirname -- "$(dirname -- "$python_path")")
 container_args+=(--bind "$environment_root:$environment_root:ro")
 
-timeout --kill-after=30s 25m apptainer exec \
+"${timeout_args[@]}" apptainer exec \
   "${container_args[@]}" \
   "$image" \
   "$python_path" -u -m experiments.rally_start_trials run \
