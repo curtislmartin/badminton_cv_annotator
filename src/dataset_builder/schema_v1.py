@@ -8,7 +8,10 @@ Decisions come from issue #22 (formulas), issue #104 (keep, cut, unresolved),
 issue #18 (this freeze), Ari's review of PR #135 (player identity and sex),
 and issue #138 (rally-dataset/1.1: shots per rally, recovery, and movement
 inefficiency, once the dataset moved onto human ShuttleSet contacts; and
-``rallies.flaw_marked``, once a flaw-marked rally stopped being dropped).
+``rallies.flaw_marked``, once a flaw-marked rally stopped being dropped;
+rally-dataset/1.2: player degradation trends and their tanh temperature; and
+rally-dataset/1.3: the commentary-to-rally link, aligned times from issue
+#136).
 See ``docs/dataset_v1_schema.md``.
 """
 
@@ -25,8 +28,8 @@ from uuid import uuid4
 import pandas as pd
 
 
-DATASET_SCHEMA = "rally-dataset/1.1"
-SCHEMA_FROZEN_ON = "2026-09-03"
+DATASET_SCHEMA = "rally-dataset/1.3"
+SCHEMA_FROZEN_ON = "2026-09-04"
 DATASET_MANIFEST_FILENAME = "dataset_manifest.json.gz"
 PLAYER_SIGNALS_DIRECTORY = "player_signals"
 
@@ -73,6 +76,13 @@ class RallyOrigin(StrEnum):
 
     ANNOTATOR = "annotator"
     SOURCE_CONTACTS = "source_contacts"
+
+
+class CommentaryRelation(StrEnum):
+    """How a commentary chunk relates to a rally it links to (issue #138)."""
+
+    INSIDE = "inside"
+    POST_RALLY = "post_rally"
 
 
 class ColumnType(StrEnum):
@@ -357,6 +367,65 @@ PLAYER_RALLIES = TableSpec(
 )
 
 
+PLAYER_TRENDS = TableSpec(
+    name="player_trends",
+    filename="player_trends.csv.gz",
+    key=("run_id", "source_dataset", "video_id", "player_id", "scope", "scope_id", "feature"),
+    columns=(
+        *_identity_columns(),
+        ColumnSpec(
+            "player_id", ColumnType.STRING, False, ReliabilityClass.DERIVED,
+            "players.player_id of the person this trend is fit for.",
+        ),
+        ColumnSpec(
+            "scope", ColumnType.STRING, False, ReliabilityClass.DERIVED,
+            "set: trend across one player's rallies within one ShuttleSet set, ordered "
+            "by source_rally. match: trend across that player's sets in the video, one "
+            "point per set (the median of the feature over the player's rallies in that "
+            "set), ordered by source_set.",
+        ),
+        ColumnSpec(
+            "scope_id", ColumnType.INTEGER, False, ReliabilityClass.DERIVED,
+            "ShuttleSet set number for scope=set. Fixed sentinel 0 for scope=match; no "
+            "ShuttleSet set is ever numbered 0.",
+        ),
+        ColumnSpec(
+            "feature", ColumnType.STRING, False, ReliabilityClass.DERIVED,
+            "Feature this trend was fit over: a player_rallies float column (for example "
+            "posture_mad) or a named rally-level column of rallies (duration_seconds, "
+            "and shots_per_rally once that column exists).",
+        ),
+        ColumnSpec(
+            "n_points", ColumnType.INTEGER, False, ReliabilityClass.DERIVED,
+            "Values that fed the fit: rallies for scope=set (at least 3), sets for "
+            "scope=match (at least 2). A fit with fewer points is not written.",
+        ),
+        ColumnSpec(
+            "slope", ColumnType.FLOAT, False, ReliabilityClass.DERIVED,
+            "Ordinary least squares slope of the feature value against its position: "
+            "the rally's source_rally number for scope=set, or the set's source_set "
+            "number for scope=match.",
+        ),
+        ColumnSpec(
+            "slope_tanh", ColumnType.FLOAT, False, ReliabilityClass.DERIVED,
+            "tanh(slope / temperature): the slope compressed to (-1, 1) so trends of "
+            "differently scaled features are comparable.",
+        ),
+        ColumnSpec(
+            "temperature", ColumnType.FLOAT, False, ReliabilityClass.DERIVED,
+            "Tanh scaling constant used for slope_tanh, stored so the scaling reverses: "
+            "slope = temperature * arctanh(slope_tanh).",
+        ),
+    ),
+    description=(
+        "One row per player, scope, and trended feature: an ordinary least squares "
+        "trend over that player's source_contacts rallies or sets, plus its "
+        "tanh-normalised slope. Annotator rallies are excluded because their player "
+        "identity is a guess, not a label."
+    ),
+)
+
+
 PLAYERS = TableSpec(
     name="players",
     filename="players.csv.gz",
@@ -490,7 +559,9 @@ PRIMITIVE_ARTIFACTS = TableSpec(
         ),
         ColumnSpec(
             "location", ColumnType.STRING, False, ReliabilityClass.OBSERVED,
-            "input_dir or export_dir: the root that relative_path is relative to. The dataset manifest records both roots.",
+            "input_dir, export_dir, or inpainted_root: the root that relative_path is "
+            "relative to. The dataset manifest records input_root and inpainted_root by "
+            "name; export_dir is implicit, since the manifest file itself lives there.",
         ),
         ColumnSpec(
             "relative_path", ColumnType.STRING, False, ReliabilityClass.OBSERVED,
@@ -526,7 +597,10 @@ def _commentary_columns() -> tuple[ColumnSpec, ...]:
         ColumnSpec(
             "timestamp_precision", ColumnType.STRING, False, ReliabilityClass.OBSERVED,
             "caption: automatic caption segment timing. whisperx_coarse: segment-level "
-            "WhisperX timing. Neither is word-level or verified against rallies.",
+            "WhisperX timing, not word-level. whisperx_aligned: chunk timing replaced "
+            "by forced-aligned word boundaries (issue #136); commentary_chunks only. "
+            "None of the three were checked against rally boundaries; that check is "
+            "the unmeasured part of commentary_rally_links.",
         ),
         ColumnSpec(
             "start_seconds", ColumnType.FLOAT, False, ReliabilityClass.OBSERVED,
@@ -592,7 +666,58 @@ COMMENTARY_CHUNKS = TableSpec(
     description=(
         "Auxiliary component: relevance-triaged commentary chunks with raw and cleaned "
         "text, tied to the video. Sentiment, concept, and player link are unresolved and "
-        "absent."
+        "absent. commentary_rally_links carries the separate, unresolved rally association."
+    ),
+)
+
+
+COMMENTARY_RALLY_LINKS = TableSpec(
+    name="commentary_rally_links",
+    filename="commentary_rally_links.csv.gz",
+    key=("run_id", "source_dataset", "video_id", "chunk_id", "rally_origin", "rally_id"),
+    columns=(
+        *_identity_columns(),
+        ColumnSpec(
+            "chunk_id", ColumnType.STRING, False, ReliabilityClass.DERIVED,
+            "commentary_chunks.chunk_id of the linked chunk.",
+        ),
+        ColumnSpec(
+            "rally_origin", ColumnType.STRING, False, ReliabilityClass.DERIVED,
+            "Always source_contacts: only ShuttleSet human-contact rallies are linked "
+            "in v1. Kept as a column so the key joins directly to rallies.",
+        ),
+        ColumnSpec(
+            "rally_id", ColumnType.INTEGER, False, ReliabilityClass.DERIVED,
+            "rallies.rally_id of the linked rally.",
+        ),
+        ColumnSpec(
+            "relation", ColumnType.STRING, False, ReliabilityClass.DERIVED,
+            "inside: the chunk starts inside this rally's span. post_rally: this rally "
+            "ended within LAG_SECONDS before the chunk started.",
+        ),
+        ColumnSpec(
+            "lag_seconds", ColumnType.FLOAT, False, ReliabilityClass.DERIVED,
+            "0.0 for relation inside; otherwise the chunk's start_seconds minus this "
+            "rally's end_seconds, the gap the pairing rule allowed.",
+        ),
+        ColumnSpec(
+            "ambiguous", ColumnType.BOOLEAN, False, ReliabilityClass.DERIVED,
+            "True when this chunk links to more than one rally under the pairing rule; "
+            "every one of its link rows carries the same value.",
+        ),
+        ColumnSpec(
+            "starts_on_masked_frame", ColumnType.BOOLEAN, True, ReliabilityClass.DERIVED,
+            "True when the chunk's start lands on a frame the optional replay mask "
+            "marks excluded. Null when the export was not given a replay mask root; "
+            "the export never drops a masked-start chunk on this basis.",
+        ),
+    ),
+    description=(
+        "One row per commentary chunk linked to one source_contacts rally under the "
+        "issue #138 pairing rule. A chunk with more than one candidate rally gets one "
+        "row per rally, all marked ambiguous. Coverage is measured; accuracy is not: "
+        "nobody has labelled a sample to check that a linked chunk actually discusses "
+        "its rally."
     ),
 )
 
@@ -600,11 +725,13 @@ COMMENTARY_CHUNKS = TableSpec(
 TABLES: tuple[TableSpec, ...] = (
     RALLIES,
     PLAYER_RALLIES,
+    PLAYER_TRENDS,
     PLAYERS,
     SOURCE_CONTACTS,
     PRIMITIVE_ARTIFACTS,
     TRANSCRIPT_SEGMENTS,
     COMMENTARY_CHUNKS,
+    COMMENTARY_RALLY_LINKS,
 )
 
 
@@ -646,6 +773,18 @@ PRIMITIVE_ARTIFACT_NOTES: tuple[ArtifactNote, ...] = (
         "shuttle_guard_codes", ReliabilityClass.PREDICTED,
         "(frame_count,) inpaint hallucination guard grades. Mask rejected grades before "
         "using shuttle positions.",
+    ),
+    ArtifactNote(
+        "shuttle_track_inpainted", ReliabilityClass.PREDICTED,
+        "(frame_count, 3) TrackNet x, y normalised by resolution, and visibility, from a "
+        "later InpaintNet pass over the ShuttleSet22 extract. The base ShuttleSet22 "
+        "extract was run with InpaintNet off, so this replaces shuttle_track with a "
+        "higher-visibility track. Do not describe as accurate.",
+    ),
+    ArtifactNote(
+        "shuttle_guard_codes_inpainted", ReliabilityClass.PREDICTED,
+        "(frame_count,) inpaint hallucination guard grades for shuttle_track_inpainted. "
+        "Mask rejected grades before using shuttle positions.",
     ),
     ArtifactNote(
         "pose_kps", ReliabilityClass.PREDICTED,
@@ -756,6 +895,21 @@ FEATURE_DISPOSITIONS: tuple[FeatureDisposition, ...] = (
         "map to people by the downcourt flag, the set number, and the set-3 change of ends.",
     ),
     FeatureDisposition(
+        "Raw degradation slope", Disposition.KEEP,
+        ("player_trends.slope", "player_trends.n_points"),
+        "Issue #104 could not fit a trend without a retained feature set and stable "
+        "player identity across rallies. Both now exist: player_rallies keeps float "
+        "features and source_contacts rallies carry an exact player_id.",
+    ),
+    FeatureDisposition(
+        "Tanh-normalised degradation", Disposition.KEEP,
+        ("player_trends.slope_tanh", "player_trends.temperature"),
+        "Issue #22 left the tanh scaling temperature undefined. Issue #138 asked to "
+        "sweep it if that was cheap, and otherwise pick a magic number like 2. The "
+        "sweep was skipped, so the feature's owner used that named fallback, 2.0; the "
+        "raw slope is kept alongside it so the scaling reverses.",
+    ),
+    FeatureDisposition(
         "Shots per rally", Disposition.KEEP,
         ("rallies.shots_per_rally",),
         "Issue #104 measured this against predicted contacts, exact on only 298 of 3,287 "
@@ -784,24 +938,18 @@ FEATURE_DISPOSITIONS: tuple[FeatureDisposition, ...] = (
         "events. Human ShuttleSet contacts fix each interval's start and end exactly.",
     ),
     FeatureDisposition(
-        "Rally-to-commentary association", Disposition.CUT, (),
-        "Post-rally join pairs 2.24% of production spans and mis-claims across rallies.",
-    ),
-    FeatureDisposition(
         "Serve speed proxy", Disposition.UNRESOLVED, (),
         "Return, static, and viewport endpoints are undefined and shuttle error is large.",
     ),
     FeatureDisposition(
-        "Raw degradation slope", Disposition.UNRESOLVED, (),
-        "Needs a retained feature set and stable player identity across rallies.",
-    ),
-    FeatureDisposition(
-        "Tanh-normalised degradation", Disposition.UNRESOLVED, (),
-        "Issue #22 does not define the temperature.",
-    ),
-    FeatureDisposition(
         "Backward extrapolation", Disposition.UNRESOLVED, (),
         "No defined scene boundary, range, or provenance policy.",
+    ),
+    FeatureDisposition(
+        "Rally-to-commentary association", Disposition.UNRESOLVED, (),
+        "Issue #138's lag rule fixes coverage on aligned times with zero ambiguity at "
+        "10 s, but accuracy is unmeasured: nobody has labelled a sample to check the "
+        "pairs are right.",
     ),
     FeatureDisposition(
         "Commentary sentiment, concept, and player link", Disposition.UNRESOLVED, (),
