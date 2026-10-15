@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from fractions import Fraction
 import hashlib
 import json
+from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -627,6 +627,17 @@ class _ConcreteRuntimeFixture:
         self.tracknet_model.write_bytes(b"fixture tracknet")
         self.deeplsd_weights.parent.mkdir(parents=True)
         self.deeplsd_weights.write_bytes(b"fixture DeepLSD weights")
+        from sklearn.dummy import DummyClassifier
+
+        from annotator.models import AnnotatorModels, save_models
+        from annotator.sequence import SequenceModels
+
+        tree = DummyClassifier(strategy='prior').fit([[0], [1]], [0, 1])
+        self.annotator_model_dir = tmp_path / 'annotator-models'
+        save_models(
+            AnnotatorModels(tree, SequenceModels(tree, tree, tree, tree, tree, tree), tree),
+            self.annotator_model_dir,
+        )
         self._install(monkeypatch)
 
     @property
@@ -656,6 +667,7 @@ class _ConcreteRuntimeFixture:
             tracknet_model=self.tracknet_model,
             deeplsd_source=self.deeplsd_source,
             deeplsd_weights=self.deeplsd_weights,
+            annotator_model_dir=self.annotator_model_dir,
         )
         runtime = self.runtime_module.DefaultPipelineRuntime(
             effective,
@@ -1066,6 +1078,25 @@ def test_default_runtime_fixture_executes_and_resumes_every_concrete_stage(
     assert fixture.boundary_calls == first_boundary_calls
     assert [event.name for event in second.events] == fixture.expected_stage_names
     assert [(event.name, event.reason) for event in second.events if not event.reused] == []
+
+
+def test_changing_annotator_bundle_reruns_annotation_without_vision_producers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from annotator.models import load_models, save_models
+
+    fixture = _ConcreteRuntimeFixture(tmp_path, monkeypatch)
+    first = cli.run_dataset_builder(fixture.config_path, fixture.run_dir, runtime_factory=fixture.factory)
+    models = load_models(fixture.annotator_model_dir)
+    changed = replace(models, contact_settings=replace(models.contact_settings, score_cutoff=.8))
+    save_models(changed, fixture.annotator_model_dir)
+    fixture.boundary_calls.clear()
+    second = cli.run_dataset_builder(fixture.config_path, fixture.run_dir, runtime_factory=fixture.factory)
+    assert 'annotation' in fixture.boundary_calls
+    assert not {'shuttle', 'pose', 'court'} & set(fixture.boundary_calls)
+    annotation_name = f'annotation:{fixture.video_id}'
+    assert any(event.name == annotation_name and not event.reused for event in second.events)
+    assert first.stopped_after is None and second.stopped_after is None
 
 
 def test_openrouter_runtime_records_effective_settings_without_key_value(
@@ -2707,3 +2738,20 @@ def test_runtime_support_owns_paths_interpreters_and_isolated_typed_state(
     assert first.ffmpeg_interpreter is None
     first.state.active_ids.add("video")
     assert second.state.active_ids == set()
+
+
+def test_terminal_progress_preserves_stage_order_outputs_and_resume(tmp_path: Path) -> None:
+    config = _write_config(tmp_path / "trial.toml")
+    run_dir = tmp_path / "run"
+    first = _FixtureControl()
+    result = cli.run_dataset_builder(config, run_dir, runtime_factory=_factory(first), progress="on")
+    assert first.executed == list(cli.PHASE_ORDER)
+    assert [event.name for event in result.events] == list(cli.PHASE_ORDER)
+    assert all(event.outcome is StageOutcome.PROCESSED for event in result.events)
+    before = {path.name: path.read_bytes() for path in (run_dir / "fixture").iterdir()}
+    second = _FixtureControl()
+    resumed = cli.run_dataset_builder(config, run_dir, runtime_factory=_factory(second), progress="on")
+    assert second.executed == []
+    assert second.restored == list(cli.PHASE_ORDER)
+    assert all(event.reused for event in resumed.events)
+    assert before == {path.name: path.read_bytes() for path in (run_dir / "fixture").iterdir()}

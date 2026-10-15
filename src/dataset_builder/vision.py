@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass, replace
-from enum import Enum
 import gzip
 import json
 import lzma
 import math
 import os
-from pathlib import Path
 import subprocess
 import tempfile
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass, replace
+from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -30,19 +30,21 @@ from dataset_builder.shuttle_quality import (
     ShuttleQualitySummary,
     summarize_shuttle_quality,
 )
+from shared.progress import report
 
 if TYPE_CHECKING:
     import pandas as pd
 
     from annotator.config import BaseAnnotatorConfig
-    from annotator.court_evidence import CourtEvidenceResult, CourtInputs
-    from annotator.point_winner import LandingFilterOptions
+    from annotator.courts.evidence import CourtEvidenceResult, CourtInputs
+    from annotator.models import AnnotatorModels
+    from annotator.outcomes.point_winner import LandingFilterOptions
     from annotator.run_video import AnnotatorResult
     from annotator.video_metadata import VideoMetadata
     from bst_x.pipeline.shuttle_extractor import WholeVideoShuttle
 
 
-ANNOTATOR_RESULT_SCHEMA = "annotator-result/0.1"
+ANNOTATOR_RESULT_SCHEMA = "annotator-result/0.2"
 COURT_EVIDENCE_SCHEMA = "court-evidence/0.2"
 RAW_REPLAY_MASK_FILENAME = "raw_replay_mask.npy.xz"
 DEFINITIVE_EXCLUSION_MASK_FILENAME = "definitive_exclusion_mask.npy.xz"
@@ -485,7 +487,7 @@ def build_detected_court_stage(
 
     :param pose_dir: where ``pose`` is saved; the detector reads those native-pixel arrays.
     """
-    from annotator.court_evidence import (
+    from annotator.courts.evidence import (
         NoAcceptedCourtError,
         build_court_detector_evidence,
         read_detector_scenes,
@@ -570,7 +572,7 @@ def load_court_vision(
     resolution: tuple[float, float],
 ) -> CourtVision:
     """Restore validated operational court evidence from compressed artefacts."""
-    from annotator.court_evidence import CourtEvidenceResult
+    from annotator.courts.evidence import CourtEvidenceResult
     from dataset_builder._court_codec import load_court_provenance
 
     root = Path(output_dir)
@@ -628,7 +630,7 @@ def _court_inputs_payload(inputs: CourtInputs) -> dict[str, object]:
 
 
 def _court_inputs_from_payload(payload: object) -> CourtInputs:
-    from annotator.court_evidence import CourtInputs
+    from annotator.courts.evidence import CourtInputs
 
     record = _object_payload(payload, "court inputs")
     expected = {
@@ -766,16 +768,19 @@ def run_full_annotation_stage(
     court: CourtVision,
     output_dir: Path,
     base: BaseAnnotatorConfig | None = None,
+    models: AnnotatorModels | None = None,
     landing_options: LandingFilterOptions | None = None,
     ref_err_px: float = 3.5,
 ) -> AnnotationOutput:
     """Run the full annotator with replay masking and persist all primitives."""
     from annotator.config import BaseAnnotatorConfig
-    from annotator.point_winner import SHIPPED_LANDING_FILTER_OPTIONS
+    from annotator.outcomes.point_winner import SHIPPED_LANDING_FILTER_OPTIONS
     from annotator.run_video import RunCapture, run_video
     from annotator.types import DeadMaskMode
 
-    effective_base = BaseAnnotatorConfig() if base is None else base
+    effective_base = models.preprocessing if models is not None else BaseAnnotatorConfig()
+    if base is not None:
+        effective_base = base
     if effective_base.dead_mask_mode is not DeadMaskMode.REPLAY:
         raise ValueError(
             "dataset-builder/0.1 requires BaseAnnotatorConfig.dead_mask_mode=DeadMaskMode.REPLAY"
@@ -811,6 +816,7 @@ def run_full_annotation_stage(
         pose.ndet,
         fps=float(metadata.fps),
         base=effective_base,
+        models=models,
         landing_options=effective_landing,
         net_band=court_inputs.net_band,
         resolution=court_inputs.resolution,
@@ -866,6 +872,7 @@ def persist_annotation_run(
     if run.shuttle_quality.frame_count != frame_count:
         raise ValueError("shuttle quality frame count differs from annotation frame count")
     root = Path(output_dir)
+    report("saving annotations")
     raw_path = save_npy_xz(root / RAW_REPLAY_MASK_FILENAME, raw_mask)
     definitive_path = save_npy_xz(root / DEFINITIVE_EXCLUSION_MASK_FILENAME, definitive_mask)
     result_path = save_json_gz(

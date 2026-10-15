@@ -2,20 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass, replace
-from datetime import datetime, timezone
-from enum import Enum
 import gzip
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, is_dataclass, replace
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
 from uuid import uuid4
 
 from dataset_builder.models import (
@@ -30,7 +30,6 @@ from dataset_builder.models import (
     StageRecord,
     freeze_json_object,
 )
-
 
 MANIFEST_FILENAME = "run_manifest.json.gz"
 REDACTED = "<redacted>"
@@ -126,7 +125,7 @@ def resolve_interpreter(
     *,
     version_option: str = "--version",
 ) -> InterpreterIdentity:
-    """Resolve an executable and capture its version string."""
+    """Locate an executable and capture its version without bypassing its venv."""
     requested = os.fspath(executable)
     located = shutil.which(requested)
     if located is None:
@@ -134,7 +133,10 @@ def resolve_interpreter(
         if not candidate.is_file():
             raise FileNotFoundError(f"interpreter is not an executable file: {requested}")
         located = os.fspath(candidate)
-    path = Path(located).resolve(strict=True)
+    # Keep the configured launch path: resolving a venv Python symlink
+    # launches the base interpreter without the venv's site-packages.
+    path = Path(os.path.abspath(located))
+    path.resolve(strict=True)  # Validate the target without using it to launch.
     if not os.access(path, os.X_OK):
         raise PermissionError(f"interpreter is not executable: {path}")
     try:

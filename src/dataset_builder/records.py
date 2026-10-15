@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from fractions import Fraction
-import math
 from pathlib import Path
 
-from annotator.point_winner import (
+from annotator.outcomes.point_winner import (
+    OTHER_HALF,
     GeometricVerdictRow,
     Half,
     Landing,
-    OTHER_HALF,
     Verdict,
     VerdictRow,
     VerdictSource,
@@ -41,6 +41,7 @@ from dataset_builder.manifest import (
 from dataset_builder.models import RunManifest, StageOutcome
 from dataset_builder.vision import load_json_gz, save_json_gz
 from scraper.commentary_pairing import CanonicalPairing
+from shared.progress import progress_iter
 
 
 @dataclass(frozen=True)
@@ -187,7 +188,7 @@ def assemble_rally_records(
     }
 
     records: list[dict[str, object]] = []
-    for rally_id, (start_frame, end_frame) in enumerate(spans):
+    for rally_id, (start_frame, end_frame) in enumerate(progress_iter(spans, "projecting rallies", unit="rallies")):
         duration_frames = end_frame - start_frame
         records.append({
             "schema": RALLY_RECORD_SCHEMA,
@@ -209,6 +210,7 @@ def assemble_rally_records(
                 "accepted": accepted_contacts[rally_id],
                 "stroke_count": annotation.n_strokes_list[rally_id],
                 "hit_height_failures": failures[rally_id],
+                "review_score": annotation.rally_confidence[rally_id] if annotation.rally_confidence else None,
             },
             "outcomes": outcome_payloads[rally_id],
             "commentary": deepcopy(commentary_payloads[rally_id]),
@@ -242,7 +244,7 @@ def write_rally_records(
     projection_manifest_sha256 = run_manifest_sha256(projection_manifest)
     sources: list[dict[str, object]] = []
     records: list[dict[str, object]] = []
-    for projection in projections:
+    for projection in progress_iter(projections, "assembling videos", unit="videos"):
         if not isinstance(projection, RallyRecordProjection):
             raise TypeError("projections must contain RallyRecordProjection values")
         if projection.input_manifest_sha256 != projection_manifest_sha256:
@@ -436,6 +438,7 @@ def _contact_payloads(
     _require_ascending_contact_frames(raw_by_rally, "raw contacts")
 
     accepted_by_rally: list[list[dict[str, object]]] = [[] for _ in spans]
+    sides_by_frame = {event.frame: event.side for event in annotation.contact_events}
     accepted_keys: set[tuple[int, int]] = set()
     for contact in annotation.filtered_contacts:
         _validate_contact(contact, spans, "accepted contact")
@@ -448,6 +451,7 @@ def _contact_payloads(
         accepted_by_rally[contact.rally_id].append({
             "stroke_idx": len(accepted_by_rally[contact.rally_id]),
             "contact_frame": contact.contact_frame,
+            "player_half": _enum_value(sides_by_frame[contact.contact_frame]) if sides_by_frame else None,
         })
     _require_ascending_contact_frames(accepted_by_rally, "accepted contacts")
     _validate_filtered_by_rally(annotation.filtered_by_rally, accepted_by_rally, rally_count)
