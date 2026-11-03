@@ -1,9 +1,11 @@
 """Sticky player evidence shared by serve and contact rules."""
 
+import itertools
 import sys
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 
@@ -37,10 +39,6 @@ class CourtGeo(NamedTuple):
     net_band: tuple[float, float]
 
 
-# Fixed body-height window for the compatibility path. Resolved config supplies it explicitly.
-BODY_UNIT_HALF_WINDOW = 12
-
-
 def court_scale_slots(
     frame_bboxes: np.ndarray, frame_scores: np.ndarray, court_geo: CourtGeo,
 ) -> np.ndarray:
@@ -55,7 +53,7 @@ def court_scale_slots(
     :return: (k,) int slot indices into the frame's pose arrays.
     """
     valid = np.isfinite(frame_scores)
-    x1, y1, x2, y2 = frame_bboxes[valid].T  # each (m,) pixels
+    x1, _y1, x2, y2 = frame_bboxes[valid].T  # each (m,) pixels
     foot_x = (x1 + x2) / 2.0  # bottom-centre; foot y is y2
     x_lo, x_hi = court_geo.x_range
     y_lo, y_hi = court_geo.y_range
@@ -92,7 +90,7 @@ def tracker_segments(
         parsed_rows.append((start, end))
 
     parsed_rows.sort()
-    for previous, current in zip(parsed_rows, parsed_rows[1:]):
+    for previous, current in itertools.pairwise(parsed_rows):
         if current[0] < previous[1]:
             raise ValueError('homography rows must not overlap')
 
@@ -260,7 +258,7 @@ def build_sticky_result(
     pose_bboxes: np.ndarray, pose_scores: np.ndarray, pose_kps: np.ndarray,
     pose_ndet: np.ndarray, gate_video_id: str,
     gate_court_info: dict[str, dict], gate_resolution_table: object,
-    resolution: tuple[float, float], half_window: int = BODY_UNIT_HALF_WINDOW,
+    resolution: tuple[float, float], half_window: int,
     *, scene_courts: tuple[SceneCourt, ...] | None = None,
 ) -> StickyResult:
     """Run sticky player tracking and measure its contact and serve evidence."""

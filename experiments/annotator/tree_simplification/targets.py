@@ -18,7 +18,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'src'))
 
-from experiments.annotator.tree_simplification import pilot
+from experiments.annotator import development as experiment
 
 # isort: split
 
@@ -30,8 +30,9 @@ from annotator.training import rally_targets
 from experiments.annotator.tree_simplification.options import (
     LabelledOptions,
 )
+from experiments.annotator.tree_simplification.pools import SCHEMA as POOL_SCHEMA
 
-SCHEMA = 'tree-simplification-five-frame-targets/1'
+SCHEMA = 'tree-simplification-five-frame-targets/2'
 
 
 @dataclass(frozen=True)
@@ -47,7 +48,9 @@ class TargetJob:
 
 def raw_five_targets(pool: LabelledOptions) -> np.ndarray:
     """Return canonical five-frame whole-rally targets aligned to pool rows."""
-    return rally_targets.option_targets(pool.original, pool.runtime, tolerance_at_30_fps=5)
+    return rally_targets.option_targets(
+        pool.video, pool.runtime, tolerance_at_30_fps=5,
+    )
 
 
 def five_frame_preferred_targets(pool: LabelledOptions, five: np.ndarray) -> np.ndarray:
@@ -87,7 +90,7 @@ def _target_job(job: TargetJob) -> dict[str, Any] | None:
     metadata_path = _metadata_path(artifact)
     identity_fields = _identity_fields(job)
     if artifact.is_file() and metadata_path.is_file():
-        metadata = pilot.read_json(metadata_path)
+        metadata = experiment.read_json(metadata_path)
         if any(metadata.get(key) != value for key, value in identity_fields.items()):
             raise ValueError(f'{job.identity}: cached targets name a different source pool or manifest')
         with lzma.open(artifact, 'rb') as stream:
@@ -99,7 +102,7 @@ def _target_job(job: TargetJob) -> dict[str, Any] | None:
     with threadpool_limits(limits=1):
         started = time.perf_counter()
         pool: LabelledOptions = joblib.load(job.pool_path)
-        if pool.original.identity != job.identity or pool.original.group != job.group:
+        if pool.video.identity != job.identity or pool.video.group != job.group:
             raise ValueError(f'{job.identity}: option pool identity or group differs from its record')
         targets = raw_five_targets(pool)
         if targets.shape != pool.targets.shape:
@@ -117,7 +120,7 @@ def _target_job(job: TargetJob) -> dict[str, Any] | None:
             'wall_s': time.perf_counter() - started,
         }
         _save_array_atomically(artifact, targets)
-        pilot.write_json(metadata_path, summary)
+        experiment.write_json(metadata_path, summary)
         return summary
 
 
@@ -128,11 +131,13 @@ def prepare_targets(
     if not 1 <= workers <= 28:
         raise ValueError('workers must be between 1 and 28')
     pools_root = pools_root.resolve()
-    pools_manifest = pilot.read_json(pools_root / 'pools.json.gz')
+    pools_manifest = experiment.read_json(pools_root / 'pools.json.gz')
+    if pools_manifest['schema'] != POOL_SCHEMA:
+        raise ValueError('Option pools use an unsupported target rule; prepare fresh pools')
     records = {}
     for pool_path in sorted((pools_root / 'videos').glob('*.joblib')):
         identity = pool_path.stem
-        record = pilot.read_json(pool_path.with_suffix('.json.gz'))
+        record = experiment.read_json(pool_path.with_suffix('.json.gz'))
         if record.get('video') != identity:
             raise ValueError(f'{identity}: pool sidecar identity differs from its filename')
         records[identity] = (pool_path, record)
@@ -156,10 +161,10 @@ def prepare_targets(
     }
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / 'targets.json.gz'
-    if manifest_path.is_file() and pilot.read_json(manifest_path) != manifest:
+    if manifest_path.is_file() and experiment.read_json(manifest_path) != manifest:
         raise ValueError('Option pool manifest changed; use a fresh target output directory')
     if not manifest_path.is_file():
-        pilot.write_json(manifest_path, manifest)
+        experiment.write_json(manifest_path, manifest)
 
     selected = [only] if only is not None else sorted(records)
     jobs = [

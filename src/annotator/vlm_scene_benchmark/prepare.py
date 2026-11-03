@@ -14,8 +14,7 @@ from typing import Any
 
 import cv2
 
-from annotator.config import COMPOSITION_CONTENT_THRESHOLD
-from annotator.fps_constants import scale_for_fps
+from annotator.config import COMPOSITION_CONTENT_THRESHOLD, BaseAnnotatorConfig, resolve
 from annotator.masks.composition import detect_cuts
 
 from .contracts import ShardSpec
@@ -46,7 +45,7 @@ def _integer(value: Any, context: str, *, minimum: int = 0) -> int:
 
 def _number(value: Any, context: str, *, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{context} must be numeric")
+        raise TypeError(f"{context} must be numeric")
     result = float(value)
     if not math.isfinite(result) or (positive and result <= 0):
         qualifier = "finite and positive" if positive else "finite"
@@ -219,7 +218,7 @@ class PreparedShardManifest:
         sampled = data["sampled_source_frames"]
         cuts = data["cut_frames"]
         if not isinstance(sampled, list) or not isinstance(cuts, list):
-            raise ValueError("sampled_source_frames and cut_frames must be JSON arrays")
+            raise TypeError("sampled_source_frames and cut_frames must be JSON arrays")
         return cls(
             schema_version=_integer(data["schema_version"], "schema_version", minimum=1),
             shard=ShardSpec.from_json(data["shard"]),
@@ -260,9 +259,9 @@ def probe_video(path: Path) -> VideoFileSpec:
         if not capture.isOpened():
             raise ValueError(f"could not open video {path}")
         fps = float(capture.get(cv2.CAP_PROP_FPS))
-        frame_count = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
-        width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        frame_count = round(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = round(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     finally:
         capture.release()
     return VideoFileSpec(path.name, sha256_file(path), fps, frame_count, width, height)
@@ -499,7 +498,7 @@ def prepare_shard(
             height=height,
             context="model video",
         )
-        min_scene_len = scale_for_fps(source.fps).composition_min_scene_len
+        min_scene_len = resolve(BaseAnnotatorConfig(), source.fps).thresholds.composition_min_scene_len
         local_cuts = detect_cuts(reference_path, reference.frame_count, content_threshold, min_scene_len)
         cut_frames = tuple(start_frame + int(frame) for frame in local_cuts)
         shard = ShardSpec(

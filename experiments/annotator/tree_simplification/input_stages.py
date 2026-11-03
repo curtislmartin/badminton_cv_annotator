@@ -34,35 +34,36 @@ from annotator.models import (
     load_models,
     save_models,
 )
+from annotator.sequence.contacts import stream_payload
 from annotator.sequence.rally_model import (
     RallyLayerModels,
     RallyLayerPrediction,
-    score_layer_confidence,
+    score_rally_review,
 )
 from annotator.training.contact import ContactTrainingVideo, fit_contact_model
-from annotator.training.sequences import whole_rally_correctness
-from annotator.training.trees import TreeBackend
+from annotator.training.sequences import (
+    whole_rally_correctness,
+)
 from annotator.training.workflow import TrainingSettings
+from experiments.annotator import development as experiment
+from experiments.annotator.development import development_for, pooled_scores
 from experiments.annotator.heuristic_only_tune.data import (
     load_original_videos,
-    score_stream,
 )
-from experiments.annotator.old_court_regression import retrain
-from experiments.annotator.old_court_regression.retrain import stream_payload
-from experiments.annotator.tree_hp_tune.run import development_for, pooled_scores
-from experiments.annotator.tree_simplification import integrate, pilot
+from experiments.annotator.tree_simplification import integrate
 from experiments.annotator.tree_simplification.data import PreparedVideo
 from experiments.annotator.tree_simplification.options import LabelledOptions
+from experiments.annotator.tree_simplification.pools import SCHEMA as POOL_SCHEMA
 from experiments.annotator.tree_simplification.prepare import (
     preprocessing_from_record,
 )
 
 
-def _prepared_inputs(prepared_root: Path) -> dict[str, Any]:
+def _prepared_inputs(prepared_root: Path, *, reuse_upstream: bool = False) -> dict[str, Any]:
     """Load and validate the saved raw preprocessing identity."""
-    pilot.require_raw_features(prepared_root)
+    experiment.require_raw_features(prepared_root)
     manifest = read_json(prepared_root / 'preparation.json.gz')
-    if manifest['source'] != source_record():
+    if not reuse_upstream and manifest['source'] != source_record():
         raise ValueError('Prepared source differs from this checkout; use a fresh prepared directory')
     inputs = manifest['inputs']
     preprocessing_from_record(inputs['preprocessing'])
@@ -75,7 +76,7 @@ def _training_records(
     prepared_root: Path, inputs: dict[str, Any], development: Any,
 ) -> dict[str, ContactTrainingVideo]:
     """Load contact rows from the fixed 32-video development training split."""
-    training_ids = development.videos(retrain.TRAINING_GROUPS)
+    training_ids = development.videos(experiment.TRAINING_GROUPS)
     training: dict[str, ContactTrainingVideo] = {}
     for identity in training_ids:
         path = prepared_root / 'videos' / f'{identity}.joblib'
@@ -117,13 +118,13 @@ def fit_contacts(
     inputs = _prepared_inputs(prepared_root)
     videos = load_original_videos(Path(inputs['paths']['shots_master']))
     development = development_for(videos)
-    training_ids = development.videos(retrain.TRAINING_GROUPS)
+    training_ids = development.videos(experiment.TRAINING_GROUPS)
     training = _training_records(prepared_root, inputs, development)
     if set(training) != set(training_ids):
         raise ValueError('Contact fit inputs do not match the fixed 32-video training split')
 
     settings = replace(
-        pilot.settings_for(TreeBackend.XGBOOST, device, 5.0, seed_offset=seed_offset),
+        experiment.settings_for(device, 5.0, seed_offset=seed_offset),
         preprocessing=preprocessing_from_record(inputs['preprocessing']),
     )
     pool_settings = _pool_settings(settings, prepared_root)
@@ -134,7 +135,7 @@ def fit_contacts(
         raise ValueError('Contact settings changed; use a fresh output directory')
     write_json(settings_path, pool_settings)
 
-    fits = retrain.contact_fit_videos(development)
+    fits = experiment.contact_fit_videos(development)
     expected_names = {'held_A', 'held_B', 'held_C', 'held_D', 'v_32'}
     if set(fits) != expected_names | {'final_40'}:
         raise ValueError('Contact fit definitions differ from the five production contact models')
@@ -183,12 +184,12 @@ def fit_contacts(
                 continue
 
             started = time.perf_counter()
-            pilot.progress(output, 'contact-fit-start', fit=name, videos=len(sampling_order))
+            experiment.progress(output, 'contact-fit-start', fit=name, videos=len(sampling_order))
             fitted = fit_contact_model(
                 [training[identity] for identity in sampling_order], settings.contact,
                 fit_video_order=fit_order,
             )
-            retrain.dump_atomically(fitted.model, model_path)
+            experiment.dump_atomically(fitted.model, model_path)
             record = {
                 'identity': identity,
                 'source': source,
@@ -197,26 +198,30 @@ def fit_contacts(
                 'wall_s': time.perf_counter() - started,
             }
             write_json(record_path, record)
-            pilot.progress(output, 'contact-fit-complete', fit=name, rows=record['rows'])
+            experiment.progress(output, 'contact-fit-complete', fit=name, rows=record['rows'])
 
     write_json(stage_path, stage)
     return stage
 
 
-def _export_inputs(run: Path, targets: Path) -> tuple[dict[str, Any], dict[str, Any], Path, Path, int]:
+def _export_inputs(
+    run: Path, targets: Path, *, reuse_upstream: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], Path, Path, int]:
     result = read_json(run / 'result.json.gz')
     settings = read_json(run / 'settings.json.gz')
     if not result.get('complete'):
         raise ValueError('Export requires a complete fitted rally run')
     if settings.get('specialists') or settings.get('original_options') or 'target_policy' not in settings:
-        raise ValueError('Export requires a general-layer run on all options with five-frame targets')
+        raise ValueError('Export requires a rally selector trained on all options with five-frame targets')
     depth = settings['layers']
     if not isinstance(depth, int) or not 1 <= depth <= 3:
         raise ValueError('Export requires a saved rally stack with one to three layers')
     pools = settings['pool_settings']
+    if pools['schema'] != POOL_SCHEMA:
+        raise ValueError('Option pools use an unsupported target rule; prepare fresh pools')
     prepared_root = Path(pools['prepared']).resolve()
     contact_run_root = Path(pools['contact_run']).resolve()
-    inputs = _prepared_inputs(prepared_root)
+    inputs = _prepared_inputs(prepared_root, reuse_upstream=reuse_upstream)
     if pools['settings']['preprocessing'] != inputs['preprocessing']:
         raise ValueError('Contact settings and prepared evidence use different preprocessing')
     if read_json(contact_run_root / 'settings.json.gz') != {
@@ -225,7 +230,7 @@ def _export_inputs(run: Path, targets: Path) -> tuple[dict[str, Any], dict[str, 
         raise ValueError('Contact-stage settings differ from the fitted pool manifest')
     source = read_json(prepared_root / 'preparation.json.gz')['source']
     contact_source = read_json(contact_run_root / 'contact-stage.json.gz')['source']
-    if contact_source != source or result['source'] != source:
+    if not reuse_upstream and (contact_source != source or result['source'] != source):
         raise ValueError('Preparation, contact and selector sources differ; refit from one clean checkout')
     if settings['target_policy']['manifest'] != read_json(targets / 'targets.json.gz'):
         raise ValueError('Five-frame target manifest differs from the fitted rally run')
@@ -240,7 +245,7 @@ def _review_rows(
     layer_prediction = prediction.refined
     if not isinstance(layer_prediction, RallyLayerPrediction):
         raise TypeError('Raw export requires a rally-layer prediction')
-    selector = score_layer_confidence(layer_prediction, None)
+    selector = score_rally_review(layer_prediction, None)
     rankings: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
     by_span = {sequence.span_id: sequence for sequence in layer_prediction.sequences}
@@ -265,12 +270,16 @@ def _review_rows(
     return rankings, rows
 
 
-def export_run(run: Path, targets: Path, output: Path, *, threads: int = 2) -> dict[str, Any]:
+def export_run(
+    run: Path, targets: Path, output: Path, *, threads: int = 2, device: str = 'cuda', reuse_upstream: bool = False,
+) -> dict[str, Any]:
     """Fit review, build a production bundle, and verify all validation streams."""
     if not 1 <= threads <= 28:
         raise ValueError('threads must be between 1 and 28')
+    if device not in ('cpu', 'cuda'):
+        raise ValueError('device must be cpu or cuda')
     run, targets, output = run.resolve(), targets.resolve(), output.resolve()
-    settings, inputs, prepared_root, contact_run_root, depth = _export_inputs(run, targets)
+    settings, inputs, prepared_root, contact_run_root, depth = _export_inputs(run, targets, reuse_upstream=reuse_upstream)
     receipt = {
         'schema': 'tree-simplification-raw-export/1',
         'run': str(run),
@@ -278,6 +287,11 @@ def export_run(run: Path, targets: Path, output: Path, *, threads: int = 2) -> d
         'settings': settings,
         'preprocessing': inputs['preprocessing'],
         'source': source_record(),
+        'device': device,
+        'upstream_sources': {
+            'preparation': read_json(prepared_root / 'preparation.json.gz')['source'],
+            'contacts': read_json(contact_run_root / 'contact-stage.json.gz')['source'],
+        },
     }
     output.mkdir(parents=True, exist_ok=True)
     receipt_path = output / 'settings.json.gz'
@@ -285,7 +299,7 @@ def export_run(run: Path, targets: Path, output: Path, *, threads: int = 2) -> d
         raise ValueError('Export inputs changed; use a fresh output directory')
     write_json(receipt_path, receipt)
     with threadpool_limits(limits=threads):
-        review = integrate.fit_review(run, depth, targets, output, settings)
+        review = integrate.fit_review(run, depth, targets, output, settings, device=device)
     pool_settings = settings['pool_settings']
     layer_models = joblib.load(run / f'layers-{depth}' / 'rally-models.joblib')
     if len(layer_models) != depth:
@@ -311,7 +325,8 @@ def export_run(run: Path, targets: Path, output: Path, *, threads: int = 2) -> d
     models = load_models(bundle)
 
     pools_root = Path(settings['pools']).resolve()
-    validation_ids = [identity for identity, group in inputs['groups'].items() if group == retrain.VALIDATION_GROUP]
+    validation_scores = read_json(run / f'layers-{depth}' / 'validation.json.gz')['per_video']
+    validation_ids = [identity for identity, group in inputs['groups'].items() if group == experiment.VALIDATION_GROUP]
     if len(validation_ids) != 8:
         raise ValueError('Prepared manifest must contain the fixed eight validation videos')
     (output / 'streams').mkdir(exist_ok=True)
@@ -320,7 +335,7 @@ def export_run(run: Path, targets: Path, output: Path, *, threads: int = 2) -> d
     rows: list[dict[str, Any]] = []
     with threadpool_limits(limits=threads):
         for identity in sorted(validation_ids):
-            prepared = pilot.load_prepared(prepared_root, identity)
+            prepared = experiment.load_prepared(prepared_root, identity)
             video = prepared.video
             if video.split != 'validation' or prepared.group != inputs['groups'][identity]:
                 raise ValueError(f'{identity}: replay split or group differs from preparation')
@@ -334,11 +349,18 @@ def export_run(run: Path, targets: Path, output: Path, *, threads: int = 2) -> d
             expected_path = run / f'layers-{depth}' / 'streams' / f'{identity}.json.gz'
             if stream != read_json(expected_path):
                 raise ValueError(f'{identity}: raw production stream differs from the saved rally run')
-            write_json(output / 'streams' / f'{identity}.json.gz', stream)
-            per_video[identity] = score_stream(video, stream)
-            review_per_video[identity], video_rows = _review_rows(video, identity, prediction)
+            confidence = dict(zip(prediction.confidence.features.span_ids, map(float, prediction.confidence.scores),
+                                  strict=True))
+            write_json(output / 'streams' / f'{identity}.json.gz', stream | {
+                'confidence': {str(sequence.span_id): confidence[sequence.span_id]
+                               for sequence in layer_prediction.sequences},
+            })
+            per_video[identity] = validation_scores[identity]
+            review_per_video[identity], video_rows = _review_rows(
+                video, identity, prediction,
+            )
             rows.extend(video_rows)
-            pilot.progress(output, 'raw-replay-parity', video=identity, complete=len(per_video), planned=8)
+            experiment.progress(output, 'raw-replay-parity', video=identity, complete=len(per_video), planned=8)
 
     pooled_review = {}
     for name in ('selector', 'fitted'):
@@ -360,7 +382,7 @@ def export_run(run: Path, targets: Path, output: Path, *, threads: int = 2) -> d
         'review': pooled_review,
     }
     write_json(output / 'result.json.gz', result)
-    pilot.progress(output, 'raw-export-complete', videos=len(per_video), totals=result['totals'])
+    experiment.progress(output, 'raw-export-complete', videos=len(per_video), totals=result['totals'])
     return result
 
 
@@ -380,6 +402,9 @@ def main() -> None:
     export.add_argument('--five-frame-targets', type=Path, required=True)
     export.add_argument('--output', type=Path, required=True)
     export.add_argument('--threads', type=int, default=2)
+    export.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
+    export.add_argument('--reuse-upstream', action='store_true',
+                        help='Reuse prepared inputs and contact fits from their recorded source revisions')
 
     args = parser.parse_args()
     if args.command == 'contacts':
@@ -388,7 +413,8 @@ def main() -> None:
             threads=args.threads, device=args.device,
         )
     else:
-        export_run(args.run, args.five_frame_targets, args.output, threads=args.threads)
+        export_run(args.run, args.five_frame_targets, args.output, threads=args.threads, device=args.device,
+                   reuse_upstream=args.reuse_upstream)
 
 
 if __name__ == '__main__':

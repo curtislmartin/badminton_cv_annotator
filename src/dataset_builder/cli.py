@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import lzma
 import os
+import pickle
 import subprocess
 import sys
 import time
 import tomllib
+import zipfile
+import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, TypeVar, cast
+from typing import Protocol, cast
 
+from annotator.models import DEFAULT_MODEL_DIRECTORY
 from dataset_builder.fixed_sources import FIXED_SOURCE_DATASET
 from dataset_builder.manifest import (
     build_stage_fingerprint,
@@ -31,6 +36,22 @@ from dataset_builder.models import (
 )
 from dataset_builder.tracknet_input import TrackNetInputMode
 from scraper._llm_provider import LLMProvider, validate_api_key_environment
+
+# Expected failures from inputs, files and external tools. Anything else is a bug and
+# keeps its traceback.
+EXPECTED_COMMAND_ERRORS = (
+    EOFError,
+    KeyError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+    lzma.LZMAError,
+    pickle.UnpicklingError,
+    subprocess.SubprocessError,
+    zipfile.BadZipFile,
+    zlib.error,
+)
 
 PHASE_ORDER = (
     "search",
@@ -69,7 +90,6 @@ _FINAL_PUBLICATIONS = {
 SemanticValidator = Callable[[Path], bool]
 RuntimeFactory = Callable[["BuilderConfig", Path, str], "PipelineRuntime"]
 ReplayRuntimeFactory = Callable[["BuilderConfig", Path, str], "ReplayPipelineRuntime"]
-ChoiceT = TypeVar("ChoiceT")
 
 
 @dataclass(frozen=True)
@@ -117,7 +137,7 @@ class BuilderConfig:
     commentary_clean_model: str
     commentary_api_key_environment: str
     fixed_sources: FixedSourceConfig | None = None
-    annotator_model_dir: Path = REPO_ROOT / 'models' / 'annotator'
+    annotator_model_dir: Path = DEFAULT_MODEL_DIRECTORY
 
 
 @dataclass(frozen=True)
@@ -316,7 +336,9 @@ def load_builder_config(path: Path, *, repo_root: Path = REPO_ROOT) -> BuilderCo
         inpaint_model=inpaint_model,
         deeplsd_source=_repo_path(models["deeplsd_source"], "models.deeplsd_source", repo_root),
         deeplsd_weights=_repo_path(models["deeplsd_weights"], "models.deeplsd_weights", repo_root),
-        annotator_model_dir=_repo_path(models.get('annotator', 'models/annotator'), 'models.annotator', repo_root),
+        annotator_model_dir=_repo_path(
+            models.get('annotator', str(DEFAULT_MODEL_DIRECTORY)), 'models.annotator', repo_root,
+        ),
         tracknet_workers=_positive_integer(
             vision["tracknet_workers"], "vision.tracknet_workers",
         ),
@@ -551,7 +573,7 @@ def _run_stage_plan(
     if decision.reusable:
         try:
             plan.restore()
-        except Exception:
+        except Exception:  # noqa: BLE001 - any restore failure falls back to rerunning the stage
             manifest = _invalidate_unrestorable_stage(run_dir, plan.name, fingerprint)
         else:
             record = next(stage for stage in manifest.stages if stage.name == plan.name)
@@ -568,7 +590,7 @@ def _run_stage_plan(
             execution,
             semantic_validation=(*execution.semantic_validation, *validations),
         )
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - the stage failure is recorded in the run manifest
         reason = f"{type(error).__name__}: {error}"
         if plan.on_failure is not None:
             plan.on_failure(reason)
@@ -745,11 +767,11 @@ def _bounded_integer(value: object, minimum: int, maximum: int, name: str) -> in
 
 def _boolean(value: object, name: str) -> bool:
     if not isinstance(value, bool):
-        raise ValueError(f"{name} must be boolean")
+        raise TypeError(f"{name} must be boolean")
     return value
 
 
-def _choice(value: object, choices: set[ChoiceT], name: str) -> ChoiceT:
+def _choice[ChoiceT](value: object, choices: set[ChoiceT], name: str) -> ChoiceT:
     if value not in choices:
         raise ValueError(f"{name} must be one of {sorted(choices, key=str)}")
     return cast(ChoiceT, value)
@@ -917,7 +939,7 @@ def _run_export_v1(arguments: argparse.Namespace) -> int:
                 video_ids=None if arguments.video_ids is None else tuple(arguments.video_ids),
             )
         )
-    except Exception as error:
+    except EXPECTED_COMMAND_ERRORS as error:
         print(f"dataset export failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
     _print_export_summary(manifest)
@@ -945,7 +967,7 @@ def _run_export_v1_shuttleset22(arguments: argparse.Namespace) -> int:
                 inpainted_root=arguments.inpainted_root,
             )
         )
-    except Exception as error:
+    except EXPECTED_COMMAND_ERRORS as error:
         print(f"dataset export failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
     _print_export_summary(manifest)
@@ -962,7 +984,7 @@ def _run_review_policy(arguments: argparse.Namespace) -> int:
             low_filter_threshold=arguments.low_filter_threshold,
             high_accept_threshold=arguments.high_accept_threshold,
         )
-    except (OSError, ValueError, EOFError) as error:
+    except (OSError, TypeError, ValueError, EOFError) as error:
         print(f"review policy failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
     print(f"dataset builder wrote optional review-policy decisions to {output}")
@@ -993,7 +1015,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             retry_unavailable=arguments.retry_unavailable,
             progress=arguments.progress,
         )
-    except Exception as error:
+    except EXPECTED_COMMAND_ERRORS as error:
         print(f"dataset builder failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
     if result.stopped_after is not None:

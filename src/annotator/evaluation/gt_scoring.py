@@ -12,6 +12,7 @@ from typing import NamedTuple, Protocol
 import numpy as np
 import pandas as pd
 
+from annotator.config import ScalingKind
 from annotator.courts.scenes import SceneCourt, court_at_frame
 from annotator.evaluation.fixtures import (
     FIXTURES,
@@ -32,7 +33,6 @@ from annotator.evaluation.scoring import (
     score_boundaries,
     score_contacts,
 )
-from annotator.fps_constants import ScalingKind
 from annotator.masks.inpaint import code_counts, grade_track
 from annotator.masks.replay import _read_homography_rows
 from annotator.outcomes import point_winner
@@ -822,7 +822,7 @@ def write_guard_diagnostics(
     video_dir.mkdir(parents=True, exist_ok=True)
     codes = inputs.keyword["inpaint_codes"]
     if not isinstance(codes, np.ndarray):
-        raise ValueError("inpaint_codes are missing from fixture inputs")
+        raise TypeError("inpaint_codes are missing from fixture inputs")
     np.save(video_dir / "codes.npy", codes, allow_pickle=False)
     with (video_dir / "rejections.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(

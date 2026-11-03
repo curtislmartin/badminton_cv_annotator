@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 
-from annotator.fps_constants import ScalingKind
+from annotator.config import ScalingKind
 from annotator.outcomes.point_winner import Half
 
 
@@ -75,3 +75,54 @@ def initial_sequences(
         sequences.append(ContactSequence(span_id, start_frame, end_frame, owned))
         previous_end = end_frame
     return tuple(sequences)
+
+
+def apply_choices(
+    initial: Sequence[ContactSequence],
+    events: Sequence[ContactEvent],
+    chosen: Mapping[int, ContactSequence],
+) -> tuple[tuple[ContactSequence, ...], tuple[ContactEvent, ...]]:
+    """Swap in each chosen sequence and rebuild the full contact stream.
+
+    Each chosen rally owns the contacts inside its bounds. Detector contacts
+    outside every chosen rally survive in the full stream.
+    """
+    by_frame: dict[int, ContactEvent] = {}
+    sequences = []
+    for sequence in initial:
+        after = chosen[sequence.span_id]
+        sequences.append(after)
+        for event in after.events:
+            by_frame[event.frame] = event
+    for event in events:
+        if not any(sequence.start_frame <= event.frame < sequence.end_frame for sequence in sequences):
+            by_frame[event.frame] = event
+    return tuple(sequences), tuple(by_frame[frame] for frame in sorted(by_frame))
+
+
+def stream_payload(sequences: Sequence[ContactSequence], events: Sequence[ContactEvent]) -> dict[str, Any]:
+    """Store final sections and the full stream with each contact's side."""
+    def event_row(event: ContactEvent) -> list:
+        return [event.frame, event.probability, None if event.side is None else event.side.value]
+
+    return {
+        'sequences': [
+            {'span_id': sequence.span_id, 'start_frame': sequence.start_frame, 'end_frame': sequence.end_frame,
+             'events': [event_row(event) for event in sequence.events]}
+            for sequence in sequences
+        ],
+        'events': [event_row(event) for event in events],
+    }
+
+
+def stream_from_payload(payload: dict[str, Any]) -> tuple[tuple[ContactSequence, ...], tuple[ContactEvent, ...]]:
+    def event_from_row(row: list) -> ContactEvent:
+        frame, probability, side = row
+        return ContactEvent(frame, probability, None if side is None else Half(side))
+
+    sequences = tuple(
+        ContactSequence(sequence['span_id'], sequence['start_frame'], sequence['end_frame'],
+                        tuple(event_from_row(row) for row in sequence['events']))
+        for sequence in payload['sequences']
+    )
+    return sequences, tuple(event_from_row(row) for row in payload['events'])

@@ -8,6 +8,7 @@ intervals; scene geometry and person votes are built from the active parent.
 """
 from __future__ import annotations
 
+import itertools
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -18,8 +19,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from annotator.config import COMPOSITION_CONTENT_THRESHOLD
-from annotator.fps_constants import scale_for_fps
+from annotator.config import COMPOSITION_CONTENT_THRESHOLD, BaseAnnotatorConfig, resolve
 from annotator.masks.composition import detect_cuts
 from annotator.outcomes.point_winner import (
     COURT_LENGTH_M,
@@ -204,16 +204,16 @@ def build_raw_cut_intervals(video_path: Path, n_frames: int, fps: float) -> list
         video_path,
         expected_frames=n_frames,
         threshold=COMPOSITION_CONTENT_THRESHOLD,
-        min_scene_len=scale_for_fps(fps).composition_min_scene_len,
+        min_scene_len=resolve(BaseAnnotatorConfig(), fps).thresholds.composition_min_scene_len,
     )
     cut_frames = np.asarray(cut_frames, dtype=int)
     boundaries = np.concatenate((np.array([0], dtype=int), cut_frames, np.array([n_frames], dtype=int)))
-    intervals = [(int(start), int(end)) for start, end in zip(boundaries[:-1], boundaries[1:])]
+    intervals = [(int(start), int(end)) for start, end in itertools.pairwise(boundaries)]
     if any(start < 0 or end > n_frames or end <= start for start, end in intervals):
         raise ValueError('detected cuts do not form non-empty in-range intervals')
     if intervals[0][0] != 0 or intervals[-1][1] != n_frames:
         raise ValueError('detected cuts do not cover the video')
-    if any(end != next_start for (_, end), (next_start, _) in zip(intervals, intervals[1:])):
+    if any(end != next_start for (_, end), (next_start, _) in itertools.pairwise(intervals)):
         raise ValueError('detected cuts contain a gap or overlap')
     return intervals
 

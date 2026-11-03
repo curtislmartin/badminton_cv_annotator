@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -34,10 +35,6 @@ def _write_chosen_export(root: Path, seed_offset: int = 0) -> tuple[dict, dict[s
     settings.pop('rally_layers')
     settings['contact']['random_seed'] = DEFAULT_TRAINING_SETTINGS.contact.random_seed + seed_offset
     settings['confidence']['random_seed'] = DEFAULT_TRAINING_SETTINGS.confidence.random_seed + seed_offset
-    settings['sequences']['serve']['random_seed'] = DEFAULT_TRAINING_SETTINGS.sequences.serve.random_seed + seed_offset
-    settings['sequences']['sequence']['random_seed'] = (
-        DEFAULT_TRAINING_SETTINGS.sequences.sequence.random_seed + seed_offset
-    )
     settings = json.loads(json.dumps(settings, default=sorted))
     contact_settings = {
         'prepared': str(root / 'prepared'),
@@ -61,7 +58,7 @@ def _write_chosen_export(root: Path, seed_offset: int = 0) -> tuple[dict, dict[s
                 'settings': contact_settings['settings'],
             },
             'tree': {
-                'random_seed': DEFAULT_TRAINING_SETTINGS.sequences.sequence.random_seed + seed_offset,
+                'random_seed': DEFAULT_TRAINING_SETTINGS.rally_layers.tree.random_seed + seed_offset,
             },
         },
         'preprocessing': preprocessing,
@@ -159,15 +156,26 @@ def _runtime_patches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, fail_vi
     monkeypatch.setattr(input_test, 'run_video', run_mock)
     monkeypatch.setattr(input_test, 'cache_sticky_result', lambda *_args: nullcontext())
     monkeypatch.setattr(input_test, 'stream_payload', lambda *_args: {'events': [], 'sequences': []})
-    monkeypatch.setattr(input_test, 'score_stream', lambda *_args: {'5': {}, '10': {}})
-    monkeypatch.setattr(input_test, 'pooled_scores', lambda _scores: {'5': {}, '10': {}})
-    monkeypatch.setattr(input_stages, '_review_rows', lambda video, identity, _prediction: (
-        {f'{ranking}-{tolerance}': {'unjudgeable': 1} for ranking in ('selector', 'fitted') for tolerance in (5, 10)},
-        [
+
+    def score_stream(_video: Any, _stream: dict) -> dict:
+        return {'5': {}, '10': {}}
+
+    def review_rows(
+        _video: Any, identity: str, _prediction: Any,
+    ) -> tuple[dict, list[dict]]:
+        rankings = {
+            f'{ranking}-{tolerance}': {'unjudgeable': 1}
+            for ranking in ('selector', 'fitted') for tolerance in (5, 10)
+        }
+        rows = [
             {'video': identity, 'span': 0, 'tolerance': tolerance, 'ranking': ranking, 'correct': -1, 'score': 0.5}
             for ranking in ('selector', 'fitted') for tolerance in (5, 10)
-        ],
-    ))
+        ]
+        return rankings, rows
+
+    monkeypatch.setattr(input_test, 'score_stream', score_stream)
+    monkeypatch.setattr(input_test, 'pooled_scores', lambda _scores: {'5': {}, '10': {}})
+    monkeypatch.setattr(input_stages, '_review_rows', review_rows)
     return run_calls, videos, load_calls
 
 

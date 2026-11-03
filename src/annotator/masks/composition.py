@@ -24,7 +24,9 @@ takes its court and homography inputs precomputed.
 Run as `python -m annotator.masks.composition --video-id ... --video <288p>
 --keep-vote <court_view.npy>` with PYTHONPATH=src, in the detect venv.
 """
+
 import argparse
+import itertools
 import logging
 from pathlib import Path
 from typing import NamedTuple
@@ -35,8 +37,10 @@ from annotator.config import (
     COMPOSITION_CONTENT_THRESHOLD,
     COMPOSITION_KEEP_VOTE,
     MASKS_DIR,
+    BaseAnnotatorConfig,
+    resolve,
 )
-from annotator.fps_constants import probe_fps, scale_for_fps
+from annotator.video_metadata import probe_fps
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +123,7 @@ def build_composition_mask(
     boundaries = np.unique(np.concatenate([[0], cut_frames.astype(int), [n_frames]]))
     mask = np.zeros(n_frames, dtype=bool)
     segments: list[CompositionSegment] = []
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
+    for start, end in itertools.pairwise(boundaries):
         start, end = int(start), int(end)
         keep_fraction = float(keep_vote[start:end].mean())
         is_dead = keep_fraction < vote
@@ -160,7 +164,7 @@ def main() -> None:
     n_frames = len(keep_vote)
 
     fps = args.fps if args.fps is not None else probe_fps(args.video)
-    min_scene_len = scale_for_fps(fps).composition_min_scene_len
+    min_scene_len = resolve(BaseAnnotatorConfig(), fps).thresholds.composition_min_scene_len
     cut_frames = detect_cuts(args.video, n_frames, args.content_threshold, min_scene_len)
     mask, segments = build_composition_mask(cut_frames, keep_vote, n_frames, args.vote)
     n_live = sum(1 for seg in segments if not seg.is_dead)

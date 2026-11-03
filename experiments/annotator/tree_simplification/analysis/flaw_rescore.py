@@ -31,7 +31,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-from annotator.sequence.contacts import scale_frames
+from annotator.sequence.contacts import scale_frames, stream_from_payload
 from annotator.training.sequences import LabelledRally
 from experiments.annotator.annotator_closeout_new_courts.scripts.evaluate_saved import (
     score_video,
@@ -47,14 +47,12 @@ from experiments.annotator.monotrack_benchmark.writeup_scripts.flaw_scoring impo
 from experiments.annotator.monotrack_benchmark.writeup_scripts.metrics import (
     IGNORE_MARGIN,
     INPUTS,
-    TREE,
     WINDOW_AFTER,
     WINDOW_BEFORE,
     ignore_left_out,
     judge_found_rallies,
     rally_ladder,
 )
-from experiments.annotator.old_court_regression.retrain import stream_from_payload
 from experiments.annotator.tree_simplification.analysis.common import (
     REPOSITORY,
     RESULTS,
@@ -65,6 +63,7 @@ from experiments.annotator.tree_simplification.analysis.common import (
 )
 
 OLD_ANNOTATOR = 'old-annotator-hgb-grid-017'
+OLD_PREDICTIONS = REPOSITORY / 'experiments/annotator/tree_hp_tune/results/test_rerun/A/v32/grid-017'
 NEW_CONFIGURATIONS = ('raw_baseline', 'body_window_36')
 TREATMENTS = ('standard', 'ignore', 'count')
 SCORED_RALLIES = 3327
@@ -91,7 +90,9 @@ def score_one(task: tuple[str, dict[str, Any], Path, list[LabelledRally]]) -> di
         labels = scored + tuple(left_out)
     _proposals, contacts, predictions, rally_rows = score_video(item['item_id'], 'test', stream, labels, item['fps'], TOLERANCE)
     sequences, _events = stream_from_payload(stream)
-    ladder = rally_ladder(judge_found_rallies(sequences, labels, scale_frames(TOLERANCE, item['fps'])), labels)
+    ladder = rally_ladder(
+        judge_found_rallies(sequences, labels, scale_frames(TOLERANCE, item['fps']), fps=item['fps']), labels,
+    )
     return {
         'labelled_rallies': len(labels),
         'labelled_contacts': len(contacts),
@@ -153,7 +154,7 @@ def check_write_up(summary: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--results', type=Path, default=RESULTS, help='tracked results folder')
-    parser.add_argument('--old-predictions', type=Path, default=TREE / 'A/v32/grid-017',
+    parser.add_argument('--old-predictions', type=Path, default=OLD_PREDICTIONS,
                         help='the old annotator test predictions, one seed-<N> folder per seed')
     parser.add_argument('--output', type=Path, required=True, help='gzip JSON file to write')
     args = parser.parse_args()

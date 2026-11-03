@@ -22,7 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 # Direct script execution needs the repo path before this import.
-from scratch.contact_det_full_ds_fit.scripts.score_contact_baseline import SCORE_DTYPE  # noqa: E402
+from scratch.contact_det_full_ds_fit.scripts.score_contact_baseline import SCORE_DTYPE
 
 D_FIXTURES = (
     "sset_01",
@@ -299,7 +299,7 @@ def build_census(
     labels_path: Path,
 ) -> dict[str, object]:
     """Build the D-only census from frozen scores, features, predictions and labels."""
-    from annotator.fps_constants import ScalingKind
+    from annotator.config import ScalingKind
     from scratch.contact_det_followup.scripts.prediction_io import (
         load_development_predictions,
     )

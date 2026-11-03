@@ -15,28 +15,30 @@ Run as `python -m scraper.commentary_pairing` with PYTHONPATH=src.
 See ``docs/scraper_pipeline/scraper_architecture.md`` for the stage and file
 contracts.
 """
+
 import argparse
 import csv
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import json
 import logging
 import tomllib
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
-from frozendict import frozendict
 import numpy as np
+from frozendict import frozendict
 
-from annotator.fps_constants import scale_for_fps
+from annotator.config import BaseAnnotatorConfig, resolve
 from annotator.masks.replay import filter_short_exclusion_runs
 from annotator.video_metadata import VideoMetadata
+
 from .config import (
     CHUNKS_DIR,
     MASKS_DIR,
-    PAIRS_CSV,
     PAIR_WINDOW_S,
+    PAIRS_CSV,
     RALLY_SPANS_CSV,
     SCRAPE_DIR,
     SOURCES_MANIFEST_NAME,
@@ -186,7 +188,7 @@ def pair_video(
     sorted_chunks = sorted(chunks, key=lambda chunk: float(chunk['start']))
     claimed: set = set()  # chunk_ids already paired
     rows: list[dict] = []
-    minimum_run = scale_for_fps(fps).replay_mask_min_frames
+    minimum_run = resolve(BaseAnnotatorConfig(), fps).thresholds.replay_mask_min_frames
     duration_filtered_replay_mask = (
         None if replay_mask is None
         else filter_short_exclusion_runs(replay_mask, minimum_run)

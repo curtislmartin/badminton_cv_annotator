@@ -18,54 +18,54 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import replace
-from datetime import datetime, timezone
 import gzip
 import hashlib
 import io
 import json
 import math
 import os
-from pathlib import Path
 import subprocess
-from typing import Any, NamedTuple, Sequence
+from collections.abc import Sequence
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import numpy as np
 
-from annotator.evaluation.fixtures import SSET_01
-from annotator.evaluation.fixtures import Fixture
-from annotator.evaluation.fixtures import FixtureDigests
-from annotator.evaluation.fixtures import fixtures_root
-from annotator.evaluation.gt_scoring import build_run_video_inputs
-from annotator.evaluation.gt_scoring import canonical_tolerance
-from annotator.evaluation.scoring import GtRally
-from annotator.evaluation.scoring import classify_all
-from annotator.evaluation.scoring import greedy_match
-from annotator.evaluation.scoring import load_gt_rallies
-from annotator.config import BaseAnnotatorConfig, SLOWMO_SPEED_FRAC
-from annotator.masks.inpaint import CODE_NAMES
-from annotator.masks.inpaint import NO_FLAG
-from annotator.review.broadcast_labels import LabelInterval
-from annotator.review.broadcast_labels import SceneTruth
-from annotator.review.broadcast_labels import VideoMetadata
-from annotator.review.broadcast_labels import read_label_csv
-from annotator.review.broadcast_labels import validate_partition
-from annotator.rally_segmentation import (
-    BODY_UNIT_WRIST_THRESHOLD,
-    build_sticky_result,
-    compute_speed,
-    detect_contact_flags,
-    find_rally_spans,
-    rolling_nanmedian,
-    tracker_segments,
+from annotator.config import SLOWMO_SPEED_FRAC, BaseAnnotatorConfig, resolve
+from annotator.evaluation.fixtures import (
+    SSET_01,
+    Fixture,
+    FixtureDigests,
+    fixtures_root,
 )
-from annotator.masks.replay import court_absence_signal
-from annotator.masks.replay import filter_short_exclusion_runs
-from annotator.masks.replay import perspective_shift_signal
-from annotator.masks.replay import velocity_drop_signal
-from annotator.resolve import resolve
+from annotator.evaluation.gt_scoring import build_run_video_inputs, canonical_tolerance
+from annotator.evaluation.scoring import (
+    GtRally,
+    classify_all,
+    greedy_match,
+    load_gt_rallies,
+)
+from annotator.masks.inpaint import CODE_NAMES, NO_FLAG
+from annotator.masks.replay import (
+    court_absence_signal,
+    filter_short_exclusion_runs,
+    perspective_shift_signal,
+    velocity_drop_signal,
+)
+from annotator.rally.contacts import impulse_cell_candidates
+from annotator.rally.evidence import build_sticky_result, tracker_segments
+from annotator.rally.spans import find_rally_spans
+from annotator.review.broadcast_labels import (
+    LabelInterval,
+    SceneTruth,
+    VideoMetadata,
+    read_label_csv,
+    validate_partition,
+)
 from annotator.run_video import RunCapture, run_video
-
+from annotator.types import compute_speed, rolling_nanmedian
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_LABELS = SCRIPT_DIR / "data/sset_01_broadcast_timeline_labels.csv.gz"
@@ -284,11 +284,11 @@ def slow_motion_details(
     if rally_median <= 0:
         raise ValueError("slow-motion rally median must be positive")
     resolved = resolve(BaseAnnotatorConfig(), fps)
-    rolling_speed = rolling_nanmedian(speed, resolved.constants.rest_window)
+    rolling_speed = rolling_nanmedian(speed, resolved.thresholds.rest_window)
     threshold = SLOWMO_SPEED_FRAC * rally_median
     signal = (
         (track[:, 2] == 1)
-        & (rolling_speed >= resolved.constants.rest_speed)
+        & (rolling_speed >= resolved.thresholds.rest_speed)
         & (rolling_speed < threshold)
     )
     return SlowMotionDetails(signal, speed, rolling_speed, rally_median, threshold)
@@ -329,16 +329,7 @@ def slow_motion_rows(
 def bootstrap_spans(track: np.ndarray, fps: float) -> list[tuple[int, int]]:
     """Reproduce the current unmasked span pass used to build the replay mask."""
     resolved = resolve(BaseAnnotatorConfig(), fps)
-    return find_rally_spans(
-        track,
-        resolved.thresholds,
-        span_open=resolved.span_open,
-        constants=resolved.constants,
-        gap_state_demotion_bound=resolved.gap_state_demotion_bound,
-        reentry_guard_variant=resolved.reentry_guard_variant,
-        reentry_guard_buffer=resolved.reentry_guard_buffer,
-        quiet_start_window=resolved.quiet_start_window,
-    )
+    return find_rally_spans(track, resolved)
 
 
 def gt_statuses(
@@ -409,8 +400,8 @@ def evaluate_serve_candidates(
         if not accepted:
             continue
         anchor = accepted[0]
-        lookback_start = max(0, anchor - resolved.constants.serve_start_lookback_frames)
-        flags = detect_contact_flags(
+        lookback_start = max(0, anchor - resolved.thresholds.serve_start_lookback_frames)
+        flags = impulse_cell_candidates(
             track,
             lookback_start,
             anchor,
@@ -429,7 +420,7 @@ def evaluate_serve_candidates(
             code = int(inpaint_codes[frame])
             wrist_pass = bool(
                 np.isfinite(sticky_distance)
-                and sticky_distance <= BODY_UNIT_WRIST_THRESHOLD
+                and sticky_distance <= resolved.thresholds.wrist_distance_body_heights
             )
             evidence_pass = visible and code == NO_FLAG and wrist_pass
             policy_pass = evidence_pass and not bool(definitive_mask[frame])
@@ -512,9 +503,9 @@ def evaluate_serve_candidates(
     policy_selected = [int(row["candidate_frame"]) for row in candidate_rows if row["selected_policy"]]
     summary = {
         "candidate_rule": {
-            "lookback_frames": resolved.constants.serve_start_lookback_frames,
+            "lookback_frames": resolved.thresholds.serve_start_lookback_frames,
             "gt_serve_tolerance_frames": tolerance,
-            "wrist_threshold_body_heights": BODY_UNIT_WRIST_THRESHOLD,
+            "wrist_threshold_body_heights": resolved.thresholds.wrist_distance_body_heights,
             "requires_visible_track": True,
             "requires_inpaint_code": NO_FLAG,
             "definitive_mask_policy": "blocked",
@@ -604,17 +595,19 @@ def _write_csv_gz(path: Path, columns: Sequence[str], rows: Sequence[dict[str, A
             extra = sorted(set(row) - expected_keys)
             raise ValueError(f"CSV row {index} keys differ: missing={missing}, extra={extra}")
         serialised.append({column: str(_csv_value(row[column])) for column in columns})
-    with path.open("wb") as raw_handle:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw_handle, mtime=0) as compressed:
-            with io.TextIOWrapper(compressed, encoding="utf-8", newline="") as text_handle:
-                writer = csv.DictWriter(
-                    text_handle,
-                    fieldnames=list(columns),
-                    extrasaction="raise",
-                    lineterminator="\n",
-                )
-                writer.writeheader()
-                writer.writerows(serialised)
+    with (
+        path.open("wb") as raw_handle,
+        gzip.GzipFile(filename="", mode="wb", fileobj=raw_handle, mtime=0) as compressed,
+        io.TextIOWrapper(compressed, encoding="utf-8", newline="") as text_handle,
+    ):
+        writer = csv.DictWriter(
+            text_handle,
+            fieldnames=list(columns),
+            extrasaction="raise",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(serialised)
     with gzip.open(path, "rt", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         reloaded = list(reader)
@@ -624,9 +617,11 @@ def _write_csv_gz(path: Path, columns: Sequence[str], rows: Sequence[dict[str, A
 
 def _write_json_gz(path: Path, value: object) -> None:
     payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
-    with path.open("wb") as raw_handle:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw_handle, mtime=0) as compressed:
-            compressed.write(payload)
+    with (
+        path.open("wb") as raw_handle,
+        gzip.GzipFile(filename="", mode="wb", fileobj=raw_handle, mtime=0) as compressed,
+    ):
+        compressed.write(payload)
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         if json.load(handle) != value:
             raise RuntimeError(f"gzip JSON reload changed value: {path}")
@@ -659,55 +654,55 @@ def _build_report(summary: dict[str, Any]) -> str:
         "",
         f"Generated: {summary['generated_at_utc']}",
         "",
-        f"Fixture profile: `{profile['name']}` from source commit "
-        f"`{profile['source_commit'] or 'unrecorded'}`.",
+        (f"Fixture profile: `{profile['name']}` from source commit "
+        f"`{profile['source_commit'] or 'unrecorded'}`."),
         "",
         "## Replay mask",
         "",
-        f"The fresh current union differs from the pinned replacement mask on "
+        (f"The fresh current union differs from the pinned replacement mask on "
         f"{summary['replay_mask']['fresh_union_pinned_raw_diff_frames']:,} frames. The raw union "
         f"flags {raw_union['flagged_frames']:,} of {raw_union['frames']:,} scored frames. "
         f"Duration filtering leaves {mask['flagged_frames']:,} flagged frames, with precision "
         f"{_fmt(mask['precision'])} and recall {_fmt(mask['recall'])}. The e2e court-invalid "
-        f"union flags {e2e_definitive['flagged_frames']:,} scored frames.",
+        f"union flags {e2e_definitive['flagged_frames']:,} scored frames."),
         "",
-        f"Court absence contributes {components['court_absence']['flagged_frames']:,} flagged "
+        (f"Court absence contributes {components['court_absence']['flagged_frames']:,} flagged "
         f"frames. Perspective shift contributes {components['perspective_shift']['flagged_frames']:,}, "
-        f"and velocity drop contributes {components['velocity_drop']['flagged_frames']:,}.",
+        f"and velocity drop contributes {components['velocity_drop']['flagged_frames']:,}."),
         "",
-        f"The e2e mask covers {gt_loss['masked_gt_extent_frames']:,} of "
-        f"{gt_loss['gt_extent_frames']:,} GT-rally extent frames.",
+        (f"The e2e mask covers {gt_loss['masked_gt_extent_frames']:,} of "
+        f"{gt_loss['gt_extent_frames']:,} GT-rally extent frames."),
         "",
         "## Slow motion",
         "",
-        f"The unchanged velocity signal uses a rally-speed median of "
+        (f"The unchanged velocity signal uses a rally-speed median of "
         f"{summary['slow_motion']['rally_speed_median']:.8f} and threshold "
         f"{summary['slow_motion']['slow_threshold']:.8f}. It flags "
-        f"{summary['slow_motion']['signal_frames']:,} frames.",
+        f"{summary['slow_motion']['signal_frames']:,} frames."),
         "",
         "## Replay duplicate margin",
         "",
-        f"Supported for follow-up: {duplicate['eligible_preceding_live_source_relations']} "
+        (f"Supported for follow-up: {duplicate['eligible_preceding_live_source_relations']} "
         f"short replay intervals have a human-adjudicated immediately preceding live source. "
         f"The long replay montage `[{duplicate['excluded_long_replay_montage']['start_frame']}, "
         f"{duplicate['excluded_long_replay_montage']['end_frame']})` is excluded by human "
         f"adjudication. "
-        f"{duplicate['same_video_gt_rallies']} GT rallies provide different-rally negatives.",
+        f"{duplicate['same_video_gt_rallies']} GT rallies provide different-rally negatives."),
         "",
         f"Retrieval margin unmeasured: {duplicate['retrieval_margin_limit']}",
         "",
         "## Serve lookback",
         "",
-        f"The current mask-policy candidate records {serve['true_positives']} true positives, "
+        (f"The current mask-policy candidate records {serve['true_positives']} true positives, "
         f"{serve['false_positives']} false positives, and {serve['false_negatives']} false negatives "
         f"across {summary['serve_lookback']['target_serve_misses']} target serve misses. Its precision "
-        f"is {_fmt(serve['precision'])} and recall is {_fmt(serve['recall'])}.",
+        f"is {_fmt(serve['precision'])} and recall is {_fmt(serve['recall'])}."),
         "",
-        f"The selected trigger frames contain {serve_truth['live']} `live`, "
+        (f"The selected trigger frames contain {serve_truth['live']} `live`, "
         f"{serve_truth['live-non-standard']} `live-non-standard`, "
         f"{serve_truth['replay']} `replay`, {serve_truth['cutaway']} `cutaway`, and "
         f"{serve_truth['other']} `other` labels. The evidence-only and current mask-policy "
-        f"counts are {'the same' if serve == summary['serve_lookback']['evidence_only'] else 'different'}.",
+        f"counts are {'the same' if serve == summary['serve_lookback']['evidence_only'] else 'different'}."),
         "",
         "These results describe one labelled video. They do not authorise a production change.",
         "",
@@ -755,7 +750,7 @@ def run_measurement(
     pinned_mask_diff_frames = int(np.count_nonzero(raw_union != committed_mask))
     resolved = resolve(BaseAnnotatorConfig(), fixture.fps)
     duration_filtered = filter_short_exclusion_runs(
-        raw_union, resolved.constants.replay_mask_min_frames,
+        raw_union, resolved.thresholds.replay_mask_min_frames,
     )
     e2e_definitive = duration_filtered | ~court_present
 
@@ -805,7 +800,7 @@ def run_measurement(
         keyword["gate_court_info"],
         keyword["gate_resolution_table"],
         fixture.resolution,
-        resolved.constants.body_unit_half_window,
+        resolved.thresholds.body_unit_half_window,
     )
     accepted_by_span = {
         int(span_id): sorted(map(int, frames))
@@ -839,7 +834,7 @@ def run_measurement(
     }
     summary: dict[str, Any] = {
         "schema_version": 1,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "generated_at_utc": datetime.now(UTC).isoformat(),
         "measurement_code": {
             "path": _display_path(Path(__file__).resolve()),
             "sha256": _sha256(Path(__file__).resolve()),
@@ -862,7 +857,7 @@ def run_measurement(
             {"path": pin.path.as_posix(), "md5": pin.md5} for pin in fixture.files
         ],
         "replay_mask": {
-            "replay_mask_min_frames": resolved.constants.replay_mask_min_frames,
+            "replay_mask_min_frames": resolved.thresholds.replay_mask_min_frames,
             "fresh_union_matches_pinned_raw_mask": pinned_mask_diff_frames == 0,
             "fresh_union_pinned_raw_diff_frames": pinned_mask_diff_frames,
             "detectors": binary_by_detector,

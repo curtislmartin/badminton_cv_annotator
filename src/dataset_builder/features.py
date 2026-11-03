@@ -10,6 +10,7 @@ reliable enough to export.
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Sequence
 from enum import IntEnum
@@ -19,9 +20,9 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
+from annotator.config import ScalingKind
 from annotator.courts.evidence import detected_court_info
 from annotator.courts.scenes import build_scene_courts, scene_ref_corners
-from annotator.fps_constants import ScalingKind
 from annotator.outcomes.point_winner import (
     COURT_LENGTH_M,
     COURT_WIDTH_M,
@@ -34,6 +35,8 @@ EYE_INDICES = (1, 2)
 HIP_INDICES = (11, 12)
 ANKLE_INDICES = (15, 16)
 COURT_SIDES = ("top", "bottom")
+# Dataset features use a fixed window, independently of annotation frame-rate scaling.
+DATASET_BODY_UNIT_HALF_WINDOW = 12
 # Issue #32 fixed the clip offsets: 2 s of lead-in before the first contact and
 # 3 s of tail after the last, so a clip keeps the serve setup and the point ending.
 CLIP_LEAD_SECONDS = 2
@@ -105,6 +108,7 @@ def derive_player_feature_inputs(
         inputs.gate_court_info,
         inputs.gate_resolution_table,
         inputs.resolution,
+        DATASET_BODY_UNIT_HALF_WINDOW,
         scene_courts=build_scene_courts(inputs.homography_rows.to_dict("records"), inputs.resolution),
     )
     selected_keypoints = select_sticky_keypoints(pose.kps, sticky.picks)
@@ -291,7 +295,7 @@ def movement_inefficiency(
     ):
         raise ValueError("contact frames must be strictly increasing and in range")
     result = np.full((max(0, len(contacts) - 1), 2), np.nan, dtype=float)
-    for interval, (start, end) in enumerate(zip(contacts, contacts[1:])):
+    for interval, (start, end) in enumerate(itertools.pairwise(contacts)):
         for slot in range(2):
             path = positions[start : end + 1, slot]
             if not np.isfinite(path).all():
@@ -387,7 +391,7 @@ def rally_timestamps(start_frame: int, end_frame: int, fps: float) -> dict[str, 
 def clip_frames(
     start_frame: int, end_frame: int, fps: Fraction, frame_count: int
 ) -> tuple[int, int]:
-    """Return the issue #32 clip range around one rally, clamped to the video."""
+    """Pad a half-open contact interval by 2/3 s, clamped only to the video."""
     validate_frame_range(start_frame, end_frame)
     if frame_count < end_frame:
         raise ValueError(f"frame_count {frame_count} does not cover end_frame {end_frame}")

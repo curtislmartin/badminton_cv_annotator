@@ -630,12 +630,12 @@ class _ConcreteRuntimeFixture:
         from sklearn.dummy import DummyClassifier
 
         from annotator.models import AnnotatorModels, save_models
-        from annotator.sequence import SequenceModels
+        from annotator.sequence.rally_model import RallyLayerModels
 
         tree = DummyClassifier(strategy='prior').fit([[0], [1]], [0, 1])
         self.annotator_model_dir = tmp_path / 'annotator-models'
         save_models(
-            AnnotatorModels(tree, SequenceModels(tree, tree, tree, tree, tree, tree), tree),
+            AnnotatorModels(tree, RallyLayerModels((tree,)), tree),
             self.annotator_model_dir,
         )
         self._install(monkeypatch)
@@ -1794,12 +1794,12 @@ def test_partial_selected_download_fails_and_can_retry(
             path = fixture.video_dir / f"{video_id}.mp4"
             if not path.exists():
                 path.write_bytes(b"fixture video")
-            entry: dict[str, object] = dict(
-                video_id=video_id,
-                title=f"Fixture {video_id}",
-                url=f"https://example.test/{video_id}",
-                commentary_eligible=True,
-            )
+            entry: dict[str, object] = {
+                "video_id": video_id,
+                "title": f"Fixture {video_id}",
+                "url": f"https://example.test/{video_id}",
+                "commentary_eligible": True,
+            }
             entries[path.name] = entry
             outcomes.append(download_scraped_videos.DownloadOutcome(
                 video_id, path.name, entry, False,

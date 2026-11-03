@@ -28,7 +28,6 @@ from dataset_builder.schema_v1 import (
     write_table,
 )
 
-
 _EXPECTED_COLUMN_NAMES: dict[str, tuple[str, ...]] = {
     "rallies": (
         "run_id", "source_dataset", "video_id", "rally_origin", "rally_id",
@@ -217,7 +216,7 @@ _EXPECTED_KEYS: dict[str, tuple[str, ...]] = {
 
 
 def test_frozen_schema_surface():
-    assert DATASET_SCHEMA == "rally-dataset/1.3"
+    assert DATASET_SCHEMA == "rally-dataset/1.4"
     assert frozen_column_names() == _EXPECTED_COLUMN_NAMES
 
     for table in TABLES:

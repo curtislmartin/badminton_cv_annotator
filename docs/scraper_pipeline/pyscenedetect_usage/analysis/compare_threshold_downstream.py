@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import itertools
 from bisect import bisect_left
 from pathlib import Path
 
@@ -13,14 +14,14 @@ import pandas as pd
 from scenedetect import open_video
 
 from annotator.artifact_io import artifacts_are_byte_equal, load_npy
-from annotator.evaluation.scoring import _scale_base30_frames
-from annotator.evaluation.scoring import load_gt_rallies
-from annotator.masks.composition import CompositionSegment
-from annotator.masks.composition import build_composition_mask
-from annotator.masks.composition import detect_cuts
-from annotator.config import COMPOSITION_KEEP_VOTE
-from annotator.fps_constants import probe_fps, scale_for_fps
-
+from annotator.config import COMPOSITION_KEEP_VOTE, BaseAnnotatorConfig, resolve
+from annotator.evaluation.scoring import _scale_base30_frames, load_gt_rallies
+from annotator.masks.composition import (
+    CompositionSegment,
+    build_composition_mask,
+    detect_cuts,
+)
+from annotator.video_metadata import probe_fps
 
 VIDEO_IDS = (1, 15, 21)
 THRESHOLDS = (22, 27)
@@ -110,7 +111,7 @@ def segment_list_after_all_dead_error(
             float(keep_vote[start:end].mean()),
             True,
         )
-        for start, end in zip(boundaries[:-1], boundaries[1:])
+        for start, end in itertools.pairwise(boundaries)
     ]
 
 
@@ -206,7 +207,7 @@ def summary_row(
 
 def timecode(frame: int, fps: float) -> str:
     """Format a frame timestamp as HH:MM:SS.mmm at the native frame rate."""
-    total_milliseconds = int(round(frame * 1000 / fps))
+    total_milliseconds = round(frame * 1000 / fps)
     hours, remainder = divmod(total_milliseconds, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
     seconds, milliseconds = divmod(remainder, 1000)
@@ -302,7 +303,7 @@ def main() -> None:
     cut_lists: dict[int, dict[int, np.ndarray]] = {22: {}, 27: {}}
     for video_id in VIDEO_IDS:
         video_input = inputs[video_id]
-        min_scene_len = scale_for_fps(video_input["fps"]).composition_min_scene_len
+        min_scene_len = resolve(BaseAnnotatorConfig(), video_input['fps']).thresholds.composition_min_scene_len
         detected_cuts = detect_cuts(
             video_input["video_path"],
             video_input["n_frames"],
@@ -324,7 +325,7 @@ def main() -> None:
     print("Threshold-27 gate passed for all videos; detecting threshold 22")
     for video_id in VIDEO_IDS:
         video_input = inputs[video_id]
-        min_scene_len = scale_for_fps(video_input["fps"]).composition_min_scene_len
+        min_scene_len = resolve(BaseAnnotatorConfig(), video_input['fps']).thresholds.composition_min_scene_len
         cut_lists[22][video_id] = detect_cuts(
             video_input["video_path"],
             video_input["n_frames"],
