@@ -334,19 +334,30 @@ def cutoff_row(curves: pd.DataFrame, threshold: float) -> pd.Series:
     return selected.mean(numeric_only=True)
 
 
+def drop_empty_detections(found: pd.DataFrame) -> pd.DataFrame:
+    """Keep found rallies with at least one accepted contact; a reviewer never opens an empty one."""
+    return found[found['outcome'] != 'no_contacts']
+
+
 def confidence_figure(data: Path, out: Path) -> None:
     # Round-trip parsing preserves distinct nearby confidence scores from the full scan.
-    test = pd.read_csv(data / 'test_confidence_curve.csv.gz', float_precision='round_trip')
-    validation = pd.read_csv(data / 'validation_confidence_curve.csv.gz', float_precision='round_trip')
+    saved_test = pd.read_csv(data / 'test_confidence_curve.csv.gz', float_precision='round_trip')
+    saved_validation = pd.read_csv(data / 'validation_confidence_curve.csv.gz', float_precision='round_trip')
     with gzip.open(data / 'confidence_cutoffs.json.gz', 'rt') as stream:
         selection = json.load(stream)
-    test_found = []
+    test_runs = []
     for seed in SEEDS:
         found = pd.read_csv(data / f'found_rallies_annotator_discovery_seed{seed}.csv.gz', float_precision='round_trip')
-        test_found.append(found.assign(seed=seed))
-    validation_found = pd.read_csv(data / 'validation_found_rallies.csv.gz', float_precision='round_trip')
+        test_runs.append(found.assign(seed=seed))
+    test_found = drop_empty_detections(pd.concat(test_runs, ignore_index=True))
+    validation_found = drop_empty_detections(
+        pd.read_csv(data / 'validation_found_rallies.csv.gz', float_precision='round_trip'),
+    )
+    # Saved curves count empty detections, so rebuild them at the same cut-offs without those.
+    test = curve(test_found, 3327, np.unique(saved_test['threshold']))
+    validation = curve(validation_found, selection['validation_rallies'], np.unique(saved_validation['threshold']))
     # Round thresholds need exact counts; saved curves use distinct validation scores.
-    test_points = curve(pd.concat(test_found, ignore_index=True), 3327, ILLUSTRATIVE_THRESHOLDS)
+    test_points = curve(test_found, 3327, ILLUSTRATIVE_THRESHOLDS)
     validation_points = curve(validation_found, selection['validation_rallies'], ILLUSTRATIVE_THRESHOLDS)
     figure, (left, right) = plt.subplots(1, 2, figsize=(14, 6.2), facecolor=SURFACE,
                                          gridspec_kw={'width_ratios': (1.25, 1)})
@@ -442,7 +453,7 @@ def stability_figure(summary: dict, out: Path) -> None:
         if group_index == len(STABILITY_GROUPS) - 1:
             top -= 0.5  # extra gap before the group that finds its own rallies: a harder task
         headings.append((top, heading))
-        rows += [(top - 0.6, key32, '32 videos (headline)', THIRTY_TWO_VIDEO_COLOURS),
+        rows += [(top - 0.6, key32, '32 videos', THIRTY_TWO_VIDEO_COLOURS),
                  (top - 1.5, key40, '40 videos', FORTY_VIDEO_COLOURS)]
         top -= 2.6
     for axes, (metric, title, (low, high)) in zip(axes_row, STABILITY_METRICS, strict=True):
@@ -476,7 +487,7 @@ def stability_figure(summary: dict, out: Path) -> None:
     for row, heading in headings:
         first.text(-0.04, row + 0.05, heading, transform=first.get_yaxis_transform(), ha='right', va='center',
                    fontsize=10, fontweight='bold', color=TEXT)
-    figure.suptitle("Our annotator's performance on ShuttleSet22, contact model trained on 32 videos (train only) vs "
+    figure.suptitle("Earlier three-model annotator: contact model trained on 32 videos (train only) vs "
                     '40 videos (train + validation)', fontsize=13, color=TEXT, x=0.01, y=0.985, ha='left', va='top')
     # Why only the contact model changes: the later trees are cross-fitted on the 32 training videos.
     figure.text(0.01, 0.938, 'The rally selector and review ranker keep their 32-video fits in both, so only the contact '
@@ -559,6 +570,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--confidence-data', type=Path, help='Separate finite-boundary confidence survey')
+    parser.add_argument('--stability-data', type=Path, help='Separate earlier 32/40-video training comparison')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -570,7 +582,9 @@ def main() -> None:
     per_video_figure(args.data, args.out)
     ladder_figure(summary, args.out, boundary_policy)
     confidence_figure(args.confidence_data or args.data, args.out)
-    stability_figure(summary, args.out)
+    stability_data = args.stability_data or args.data
+    stability_summary = json.loads((stability_data / 'contact_summary.json').read_text())['summary']
+    stability_figure(stability_summary, args.out)
     court_error_figure(pd.read_csv(args.data / 'rally_courts.csv.gz'), args.out)
 
 

@@ -29,7 +29,7 @@ flowchart LR
 
 *GIF at half speed; detected court in red*
 
-We use physical rules to find the court, skip replays and other broadcast events, split the video into rallies, spot candidate hits and assign each hit to a player. Rallies are then refined and assigned confidence scores by three gradient-boosted tree models (XGBoost).
+We use physical rules to find the court, skip replays and other broadcast events, split the video into rallies, spot candidate hits and assign each hit to a player. Rallies are then refined and assigned confidence scores by four gradient-boosted tree models (XGBoost).
 
 We benchmarked our annotator against [MonoTrack](https://cs.stanford.edu/people/paulliu/files/cvpr-2022.pdf) (CVPR 2022, 130k parameters), training both on the same 32 [ShuttleSet](https://arxiv.org/abs/2306.04948) (KDD 2023) videos, and testing on the separate ShuttleSet22 dataset ([CoachAI](https://github.com/wywyWang/CoachAI-Projects/tree/main/ShuttleSet)).
 
@@ -43,12 +43,12 @@ less manual review:
 
 | Confidence threshold | Found rallies kept | Found TP rallies kept | Right start and end | Fully correct rallies |
 | ---: | ---: | ---: | ---: | ---: |
-| 0.50 | 1,714 | 1,512 | 88.2% | 77.5% |
-| 0.70 | 994 | 912 | 91.8% | 85.1% |
-| 0.80 | 469 | 441 | 94.1% | 89.6% |
+| 0.50 | 1,757 | 1,529 | 87.0% | 76.0% |
+| 0.70 | 999 | 901 | 90.2% | 83.1% |
+| 0.80 | 434 | 402 | 92.7% | 87.7% |
 
-*TP = correct rally boundaries. Test set: 3,327 labelled rallies; ~3,659 detections
-before filtering. Five-seed averages. “Right start and end” allows up to
+*TP = correct rally boundaries. Test set: 3,327 labelled rallies; ~3,507 predicted
+rallies with at least one contact before filtering. Five-seed averages. “Right start and end” allows up to
 2 seconds early or 10 frames late for the first contact,
 and 10 frames early or 3 seconds late for the last contact (at 30 fps). These
 buffers match our dataset format and give useful context.*
@@ -63,6 +63,7 @@ The court detector returns the four outer corners of the court in an image or vi
 | --- | ---: | ---: |
 | Ours | 3.8 px | 85.8% |
 | MonoTrack's | 6.5 px | 17.2% |
+| SAM 3 | 6.6 px | 40.5% |
 
 *Errors are in 1920×1080 video pixels*
 
